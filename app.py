@@ -1143,8 +1143,8 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
             keep["amount"] = keep["amount_str"].apply(lambda x: to_int_money(x, 0))
             keep["day"] = pd.to_numeric(keep.get("day"), errors="coerce").fillna(1).astype(int)
                 # 선택 월 기준으로 날짜 재구성
-                keep["day"] = keep["day"].clip(1, calendar.monthrange(selected_year, selected_month)[1])
-                keep["date"] = pd.to_datetime(
+            keep["day"] = keep["day"].clip(1, calendar.monthrange(selected_year, selected_month)[1])
+            keep["date"] = pd.to_datetime(
                     keep["day"].apply(lambda dd: date(selected_year, selected_month, int(dd))),
                     errors="coerce"
                 )
@@ -1293,4 +1293,5 @@ with tab_card:
 # Footer
 # ============================================================
 st.caption("Made by Gayoung")
+
 
