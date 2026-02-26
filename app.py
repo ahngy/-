@@ -71,6 +71,24 @@ st.markdown(
         font-variant-numeric: tabular-nums;
       }
       .total-diff.neg { color: #d11; }
+    
+
+      /* ✅ Tabs sticky (keep visible while scrolling) */
+      div[data-testid="stTabs"]{
+        position: sticky;
+        top: 0.35rem;
+        z-index: 999;
+        background: var(--bg, #f7f7fb);
+        padding-top: 0.25rem;
+        padding-bottom: 0.25rem;
+      }
+      @supports ((-webkit-backdrop-filter: blur(10px)) or (backdrop-filter: blur(10px))) {
+        div[data-testid="stTabs"]{
+          -webkit-backdrop-filter: blur(12px);
+          backdrop-filter: blur(12px);
+        }
+      }
+
     </style>
     """,
     unsafe_allow_html=True
@@ -179,6 +197,7 @@ def render_budget_table_html(df: pd.DataFrame) -> str:
         budget = int(pd.to_numeric(r["목표(원)"], errors="coerce") or 0)
         spent = int(pd.to_numeric(r["실제지출(원)"], errors="coerce") or 0)
         diff = int(pd.to_numeric(r["차액(원)"], errors="coerce") or 0)
+        status = html_escape(r["상태"])
         diff_class = "diff-neg" if diff < 0 else "diff-pos"
         rows_html.append(
             f"""
@@ -843,7 +862,7 @@ with tab_main:
     components.html(
         render_budget_table_html(show_df),
         height=dynamic_table_height(len(show_df)),
-        scrolling=False
+        scrolling=True
     )
 
     st.divider()
@@ -865,14 +884,15 @@ with tab_main:
             view,
             hide_index=True,
             use_container_width=True,
+            height=dynamic_table_height(len(view)),
             column_config={
                 "삭제": st.column_config.CheckboxColumn("삭제"),
                 "day": st.column_config.NumberColumn("일", min_value=1, max_value=31, step=1),
                 "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
                 "category": st.column_config.SelectboxColumn("카테고리", options=all_categories),
                 "amount_str": st.column_config.TextColumn("금액(원)"),
-                },
-            height=dynamic_table_height(len(view), base=140, row_h=38, min_h=260, max_h=2000),
+                "memo": st.column_config.TextColumn("메모"),
+            },
             key="ledger_editor",
         )
 
@@ -887,13 +907,17 @@ with tab_main:
 
                 keep = ed[ed["삭제"] != True].copy()
                 keep["amount"] = keep["amount_str"].apply(lambda x: to_int_money(x, 0))
-                keep["day"] = pd.to_numeric(keep.get("day"), errors="coerce").fillna(1).astype(int)
-                # 선택 월 기준으로 날짜 재구성
-                keep["day"] = keep["day"].clip(1, calendar.monthrange(selected_year, selected_month)[1])
-                keep["date"] = pd.to_datetime(
-                    keep["day"].apply(lambda dd: date(selected_year, selected_month, int(dd))),
-                    errors="coerce"
-                )
+                # '일' -> 선택월의 실제 날짜로 변환
+                _, _, _last = month_range(selected_year, selected_month)
+                def _make_date_from_day(x):
+                    try:
+                        d = int(pd.to_numeric(x, errors="coerce"))
+                    except Exception:
+                        d = 1
+                    d = max(1, min(d, _last))
+                    return pd.Timestamp(date(selected_year, selected_month, d))
+                keep["date"] = keep["day"].apply(_make_date_from_day)
+
                 keep["memo"] = keep["memo"].fillna("")
                 keep["type"] = keep["type"].fillna("")
                 keep["category"] = keep["category"].fillna("")
@@ -962,6 +986,7 @@ with tab_budget:
         bview,
         hide_index=True,
         use_container_width=True,
+        height=dynamic_table_height(len(view)),
         column_config={
             "category": st.column_config.TextColumn("카테고리", disabled=True),
             "budget_str": st.column_config.TextColumn("목표 금액(원)"),
@@ -1009,21 +1034,22 @@ with tab_fixed:
         fview,
         hide_index=True,
         use_container_width=True,
+        height=dynamic_table_height(len(fview)),
         num_rows="dynamic",
         column_config={
             "name": st.column_config.TextColumn("이름"),
             "amount_str": st.column_config.TextColumn("금액(원)"),
             "day": st.column_config.NumberColumn("지출일(1~31)", min_value=1, max_value=31, step=1),
-        },
+            },
         key="fixed_editor",
     )
 
     if st.button("고정지출 저장", key="fixed_save"):
         saved = edited_fixed.copy()
         saved["name"] = saved["name"].fillna("").astype(str)
+        saved["memo"] = ""
         saved["amount"] = saved["amount_str"].apply(lambda x: to_int_money(x, 0))
         saved["day"] = pd.to_numeric(saved["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
-        saved["memo"] = ""
 
         # 기존 ID 유지 + 새 행은 UUID 생성
         new_len = len(saved)
@@ -1099,13 +1125,13 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
         view,
         hide_index=True,
         use_container_width=True,
+        height=dynamic_table_height(len(view)),
         column_config={
             "삭제": st.column_config.CheckboxColumn("삭제"),
             "day": st.column_config.NumberColumn("일", min_value=1, max_value=31, step=1),
             "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
             "amount_str": st.column_config.TextColumn("금액(원)"),
-        },
-        height=dynamic_table_height(len(view), base=140, row_h=38, min_h=260, max_h=2000),
+            },
         key=f"{state_key}_editor",
     )
 
@@ -1119,18 +1145,11 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
 
             keep = ed[ed["삭제"] != True].copy()
             keep["amount"] = keep["amount_str"].apply(lambda x: to_int_money(x, 0))
-            keep["day"] = pd.to_numeric(keep.get("day"), errors="coerce").fillna(1).astype(int)
-            # 기존 날짜의 연/월을 유지하고 "일"만 교체
-            base_dates = df0.set_index("id")["date"] if "date" in df0.columns and len(df0) else pd.Series(dtype="datetime64[ns]")
-            def _rebuild_date(row):
-                did = str(row.get("id"))
-                bd = pd.to_datetime(base_dates.get(did), errors="coerce") if len(base_dates) else pd.NaT
-                if pd.isna(bd):
-                    bd = pd.to_datetime(date.today())
-                last = calendar.monthrange(int(bd.year), int(bd.month))[1]
-                dd = int(max(1, min(int(row.get("day", 1)), last)))
-                return pd.Timestamp(int(bd.year), int(bd.month), dd)
-            keep["date"] = keep.apply(_rebuild_date, axis=1)
+            # 날짜는 '일'만 표시(편집 비활성). 기존 날짜를 유지합니다.
+            orig_dates = df0.set_index("id")["date"]
+            keep["date"] = keep["id"].map(orig_dates)
+            keep["date"] = pd.to_datetime(keep["date"], errors="coerce")
+
             keep["memo"] = keep["memo"].fillna("")
             keep["type"] = keep["type"].fillna("")
 
@@ -1181,6 +1200,7 @@ with tab_card:
         cards_df,
         hide_index=True,
         use_container_width=True,
+        height=dynamic_table_height(len(fview)),
         num_rows="dynamic",
         column_config={
             "card_name": st.column_config.TextColumn("카드명"),
@@ -1245,12 +1265,13 @@ with tab_card:
         view,
         hide_index=True,
         use_container_width=True,
+        height=dynamic_table_height(len(fview)),
         num_rows="dynamic",
         column_config={
             "merchant": st.column_config.TextColumn("정기결제명"),
             "amount_str": st.column_config.TextColumn("금액(원)"),
             "day": st.column_config.NumberColumn("결제일", min_value=1, max_value=31, step=1),
-        },
+            },
         key="subs_editor_no_active",
     )
 
