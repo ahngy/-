@@ -1112,7 +1112,7 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
 
     view = df.copy()
     view["date"] = pd.to_datetime(view["date"], errors="coerce")
-        view["day"] = view["date"].dt.day.astype("Int64")
+    view["day"] = view["date"].dt.day.astype("Int64")
     view["amount_str"] = view["amount"].apply(money_str)
     view = view[["id", "day", "type", "amount_str", "memo"]].copy()
     view.insert(0, "삭제", False)
@@ -1293,3 +1293,4 @@ with tab_card:
 # Footer
 # ============================================================
 st.caption("Made by Gayoung")
+
