@@ -13,31 +13,54 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-# 기본 설정 (⚠️ Streamlit 규칙: set_page_config는 최상단에서 1번)
+# 기본 설정
 # ============================================================
 st.set_page_config(page_title="가계부", layout="centered")
 
 # ============================================================
-# 🔐 비밀번호 보호 (Secrets 방식 우선)
+# 🔐 로그인 (users가 있으면 아이디/비번, 없으면 기존 단일 비번)
 # ============================================================
-PASSWORD = st.secrets.get("app", {}).get("password", "ab190427")  # secrets 없으면 기존값 fallback
+PASSWORD = st.secrets.get("app", {}).get("password", "ab190427")
+USERS = st.secrets.get("users", {})  # [users] 섹션이 없으면 {}
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+if "current_user" not in st.session_state:
+    st.session_state.current_user = ""
+
+def do_logout():
+    st.session_state.authenticated = False
+    st.session_state.current_user = ""
+    st.rerun()
 
 if not st.session_state.authenticated:
     st.title("🔒 가계부 로그인")
 
-    pw = st.text_input("비밀번호를 입력하세요", type="password")
-    login = st.button("로그인", use_container_width=True)
+    if isinstance(USERS, dict) and len(USERS) > 0:
+        username = st.text_input("아이디", value="")
+        pw = st.text_input("비밀번호", type="password")
+        login = st.button("로그인", use_container_width=True)
 
-    if login:
-        if pw.strip() == PASSWORD:
-            st.session_state.authenticated = True
-            st.success("로그인 성공!")
-            st.rerun()
-        else:
-            st.error("비밀번호가 틀렸어요.")
+        if login:
+            if username in USERS and pw.strip() == str(USERS[username]).strip():
+                st.session_state.authenticated = True
+                st.session_state.current_user = username
+                st.success("로그인 성공!")
+                st.rerun()
+            else:
+                st.error("아이디/비밀번호가 틀렸어요.")
+    else:
+        pw = st.text_input("비밀번호를 입력하세요", type="password")
+        login = st.button("로그인", use_container_width=True)
+
+        if login:
+            if pw.strip() == PASSWORD:
+                st.session_state.authenticated = True
+                st.session_state.current_user = "me"
+                st.success("로그인 성공!")
+                st.rerun()
+            else:
+                st.error("비밀번호가 틀렸어요.")
 
     st.stop()
 
@@ -93,6 +116,7 @@ def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
     return df[columns].copy()
 
 def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
+    # ⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
     ws = get_or_create_worksheet(ws_title)
     out = df.copy()
 
@@ -103,9 +127,25 @@ def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
     out = out[columns].fillna("")
 
     values = [columns] + out.astype(str).values.tolist()
-
     ws.clear()
     ws.update(values)
+
+def ws_append_row(ws_title: str, row_dict: dict, columns: list[str]) -> None:
+    # ✅ 빠른 추가(append) 저장 (동시 입력에도 강함)
+    ws = get_or_create_worksheet(ws_title)
+
+    # 헤더 없으면 생성
+    existing = ws.get_all_values()
+    if not existing:
+        ws.update([columns])
+
+    row = []
+    for c in columns:
+        v = row_dict.get(c, "")
+        if v is None:
+            v = ""
+        row.append(str(v))
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
 def clear_cache_and_rerun(msg: str | None = None):
     st.cache_data.clear()
@@ -126,14 +166,13 @@ LUMPSUM_CATEGORY = "10. 목돈지출"
 
 budget_categories = [c for c in expense_categories if c not in [FIXED_CATEGORY, LUMPSUM_CATEGORY]]
 
-# ✅ 의도한 순서 유지
 all_categories = []
 for c in expense_categories + income_categories:
     if c not in all_categories:
         all_categories.append(c)
 
 # ============================================================
-# CSS (원본 그대로)
+# CSS (기존 + 모바일 iOS 최적화 추가)
 # ============================================================
 st.markdown(
     """
@@ -266,6 +305,29 @@ st.markdown(
         letter-spacing: -0.1px;
       }
       .ios-danger{ color: var(--danger); }
+
+      /* ===== Mobile iOS tuning (추가) ===== */
+      @media (max-width: 720px){
+        section.main > div { padding-left: 10px; padding-right: 10px; }
+        h1 { font-size: 1.35rem; }
+        h2 { font-size: 1.15rem; }
+        h3 { font-size: 1.05rem; }
+
+        /* iOS 입력 줌 방지 */
+        input, textarea { font-size: 16px !important; }
+
+        /* Tabs touch */
+        div[data-testid="stTabs"] button{
+          padding: 10px 12px !important;
+          font-size: 0.95rem !important;
+        }
+
+        /* Buttons touch */
+        .stButton > button, .stDownloadButton > button{
+          padding: 12px 14px !important;
+          font-size: 1rem !important;
+        }
+      }
     </style>
     """,
     unsafe_allow_html=True
@@ -462,19 +524,23 @@ def render_budget_table_html(df: pd.DataFrame) -> str:
     """
 
 # ============================================================
-# ✅ Google Sheets 기반 "테이블" 컬럼 정의
+# ✅ Sheets "테이블" 컬럼 정의 (공동사용: user 추가)
 # ============================================================
-LEDGER_COLS = ["id", "date", "type", "category", "amount", "memo", "fixed_key"]
+LEDGER_COLS = ["id", "date", "type", "category", "amount", "memo", "fixed_key", "user"]
 BUDGET_COLS = ["year", "month", "category", "budget"]
 FIXED_COLS = ["fixed_id", "name", "amount", "day", "memo"]
-SIMPLE_COLS = ["id", "date", "type", "amount", "memo"]
+SIMPLE_COLS = ["id", "date", "type", "amount", "memo", "user"]
 CARDS_COLS = ["card_name", "benefits"]
 CARD_SUBS_COLS = ["card_name", "merchant", "amount", "day", "memo"]
 
+def current_user() -> str:
+    u = str(st.session_state.current_user or "").strip()
+    return u if u else "me"
+
 # ============================================================
-# 가계부 로드/저장 (Sheets)
+# 로드/저장 (Sheets)
 # ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=20)
 def load_ledger() -> pd.DataFrame:
     df = ws_read_df("ledger", LEDGER_COLS)
 
@@ -485,19 +551,19 @@ def load_ledger() -> pd.DataFrame:
         df["type"] = df["type"].fillna("")
         df["category"] = df["category"].fillna("")
         df["fixed_key"] = df["fixed_key"].fillna("").astype(str)
+        df["user"] = df["user"].fillna("").astype(str)
 
     if "id" not in df.columns:
         df.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(df))])
 
-    save_ledger(df)
+    # ⚠️ 여기서 save_ledger(df) 자동 호출은 "로드 시 덮어쓰기"라 불필요한 느려짐의 원인이라 제거
     return df[LEDGER_COLS].copy()
 
 def save_ledger(df: pd.DataFrame) -> None:
     out = df.copy()
-    if "id" not in out.columns:
-        out.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(out))])
-    if "fixed_key" not in out.columns:
-        out["fixed_key"] = ""
+    for c in LEDGER_COLS:
+        if c not in out.columns:
+            out[c] = "" if c not in ["amount"] else 0
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
@@ -505,11 +571,12 @@ def save_ledger(df: pd.DataFrame) -> None:
     out["type"] = out["type"].fillna("")
     out["category"] = out["category"].fillna("")
     out["fixed_key"] = out["fixed_key"].fillna("").astype(str)
+    out["user"] = out["user"].fillna("").astype(str)
 
     ws_write_df("ledger", out[LEDGER_COLS], LEDGER_COLS)
 
 # ============================================================
-# ✅ 고정지출 월별 반영 (중복 방지) (원본 그대로)
+# ✅ 고정지출/정기결제 반영 (user도 포함)
 # ============================================================
 def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFrame, year: int, month: int):
     if fixed_df is None or len(fixed_df) == 0:
@@ -553,7 +620,8 @@ def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFr
             "category": FIXED_CATEGORY,
             "amount": amount,
             "memo": f"[고정지출] {full_memo}".strip(),
-            "fixed_key": key
+            "fixed_key": key,
+            "user": current_user(),
         })
 
     if not add_rows:
@@ -562,9 +630,6 @@ def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFr
     out = pd.concat([out, pd.DataFrame(add_rows)], ignore_index=True)
     return out, len(add_rows)
 
-# ============================================================
-# ✅ 정기결제 월별 반영 (중복 방지) (원본 그대로)
-# ============================================================
 def apply_subs_to_ledger_for_month(ledger_df: pd.DataFrame, subs_df: pd.DataFrame, year: int, month: int):
     if subs_df is None or len(subs_df) == 0:
         return ledger_df, 0
@@ -612,7 +677,8 @@ def apply_subs_to_ledger_for_month(ledger_df: pd.DataFrame, subs_df: pd.DataFram
             "category": FIXED_CATEGORY,
             "amount": amount,
             "memo": full_memo,
-            "fixed_key": key
+            "fixed_key": key,
+            "user": current_user(),
         })
 
     if not add_rows:
@@ -622,9 +688,9 @@ def apply_subs_to_ledger_for_month(ledger_df: pd.DataFrame, subs_df: pd.DataFram
     return out, len(add_rows)
 
 # ============================================================
-# 월별 예산 로드/저장 (Sheets)
+# 예산/고정/경조사/제로페이/카드
 # ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def load_budget_month(expense_cats: list[str], year: int, month: int) -> pd.DataFrame:
     bdf_all = ws_read_df("budgets_monthly", BUDGET_COLS)
 
@@ -672,10 +738,7 @@ def save_budget_month(bdf_month: pd.DataFrame, year: int, month: int) -> None:
     merged = pd.concat([bdf_all, out_month], ignore_index=True)
     ws_write_df("budgets_monthly", merged, BUDGET_COLS)
 
-# ============================================================
-# 고정지출 로드/저장 (Sheets)
-# ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def load_fixed() -> pd.DataFrame:
     fdf = ws_read_df("fixed_expenses", FIXED_COLS)
 
@@ -689,8 +752,6 @@ def load_fixed() -> pd.DataFrame:
         fdf["day"] = pd.to_numeric(fdf["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
         fdf["memo"] = fdf["memo"].fillna("")
         fdf["name"] = fdf["name"].fillna("")
-
-        save_fixed(fdf)
         return fdf.reset_index(drop=True)
 
     return pd.DataFrame(columns=FIXED_COLS)
@@ -715,35 +776,32 @@ def save_fixed(fdf: pd.DataFrame) -> None:
     out = out[out["name"].str.strip() != ""].copy()
     ws_write_df("fixed_expenses", out[FIXED_COLS], FIXED_COLS)
 
-# ============================================================
-# 경조사비/제로페이 로드/저장 (Sheets)
-# ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=20)
 def load_simple_money_log(ws_title: str) -> pd.DataFrame:
     df = ws_read_df(ws_title, SIMPLE_COLS)
     if len(df):
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["type"] = df["type"].fillna("")
         df["memo"] = df["memo"].fillna("")
+        df["user"] = df["user"].fillna("").astype(str)
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
     return df
 
 def save_simple_money_log(ws_title: str, df: pd.DataFrame) -> None:
     out = df.copy()
-    if "id" not in out.columns:
-        out.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(out))])
+    for c in SIMPLE_COLS:
+        if c not in out.columns:
+            out[c] = "" if c != "amount" else 0
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
     out["type"] = out["type"].fillna("")
     out["memo"] = out["memo"].fillna("")
+    out["user"] = out["user"].fillna("").astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
 
     ws_write_df(ws_title, out[SIMPLE_COLS], SIMPLE_COLS)
 
-# ============================================================
-# 카드 (Sheets)
-# ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=120)
 def load_cards() -> pd.DataFrame:
     df = ws_read_df("cards", CARDS_COLS)
     df["card_name"] = df["card_name"].fillna("").astype(str)
@@ -758,7 +816,7 @@ def save_cards(df: pd.DataFrame) -> None:
     out = out[out["card_name"].str.strip() != ""].copy()
     ws_write_df("cards", out[CARDS_COLS], CARDS_COLS)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def load_card_subs() -> pd.DataFrame:
     df = ws_read_df("card_subscriptions", CARD_SUBS_COLS)
     df["card_name"] = df["card_name"].fillna("").astype(str)
@@ -785,7 +843,7 @@ def save_card_subs(df: pd.DataFrame) -> None:
     ws_write_df("card_subscriptions", out[CARD_SUBS_COLS], CARD_SUBS_COLS)
 
 # ============================================================
-# 엑셀 다운로드 생성 (원본 그대로)
+# 엑셀 다운로드 (user는 제외해도 됨 — 원래 느낌 유지)
 # ============================================================
 def make_excel_bytes(
     selected_year: int,
@@ -827,22 +885,22 @@ def make_excel_bytes(
     if len(month_ledger):
         out_ledger = month_ledger.copy()
         out_ledger["date"] = pd.to_datetime(out_ledger["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("0000-00-00")
-        out_ledger = out_ledger.drop(columns=["id", "fixed_key"], errors="ignore")
+        out_ledger = out_ledger.drop(columns=["id", "fixed_key", "user"], errors="ignore")
         out_ledger = out_ledger.sort_values("date")
     else:
-        out_ledger = month_ledger.drop(columns=["id", "fixed_key"], errors="ignore")
+        out_ledger = month_ledger.drop(columns=["id", "fixed_key", "user"], errors="ignore")
 
     fixed_clean = fixed_df.drop(columns=["fixed_id"], errors="ignore")
 
     if len(month_event):
         month_event = month_event.copy()
         month_event["date"] = pd.to_datetime(month_event["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("0000-00-00")
-        month_event = month_event.drop(columns=["id"], errors="ignore")
+        month_event = month_event.drop(columns=["id", "user"], errors="ignore")
 
     if len(month_zeropay):
         month_zeropay = month_zeropay.copy()
         month_zeropay["date"] = pd.to_datetime(month_zeropay["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("0000-00-00")
-        month_zeropay = month_zeropay.drop(columns=["id"], errors="ignore")
+        month_zeropay = month_zeropay.drop(columns=["id", "user"], errors="ignore")
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -856,7 +914,21 @@ def make_excel_bytes(
     return bio.getvalue()
 
 # ============================================================
-# 탭 구성 (원본 그대로)
+# 사이드바: 사용자/새로고침/로그아웃
+# ============================================================
+with st.sidebar:
+    st.markdown("### 👤 현재 로그인")
+    st.write(f"**{current_user()}**")
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        if st.button("새로고침", use_container_width=True):
+            clear_cache_and_rerun()
+    with col_s2:
+        if st.button("로그아웃", use_container_width=True):
+            do_logout()
+
+# ============================================================
+# 탭 구성
 # ============================================================
 tab_main, tab_budget, tab_fixed, tab_event, tab_zeropay, tab_card = st.tabs(
     ["가계부", "예산 설정", "고정지출", "경조사비", "제로페이", "신용카드"]
@@ -890,20 +962,20 @@ with tab_main:
 
         memo = st.text_input("메모(선택)", key="ledger_memo")
 
+    # ✅ 여기서부터 속도 개선 핵심: append로 바로 저장
     if submitted:
-        ledger_df = load_ledger()
         amt = to_int_money(amt_str, 0)
         new_row = {
             "id": str(uuid.uuid4()),
-            "date": pd.Timestamp(entry_date),
+            "date": str(entry_date),   # "YYYY-MM-DD"
             "type": entry_type,
             "category": category,
             "amount": int(amt),
             "memo": memo,
-            "fixed_key": ""
+            "fixed_key": "",
+            "user": current_user(),
         }
-        ledger_df = pd.concat([ledger_df, pd.DataFrame([new_row])], ignore_index=True)
-        save_ledger(ledger_df)
+        ws_append_row("ledger", new_row, LEDGER_COLS)
         clear_cache_and_rerun("추가되었습니다!")
 
     st.divider()
@@ -926,6 +998,10 @@ with tab_main:
 
     with st.expander("표시 옵션", expanded=False):
         show_cumulative = st.checkbox("월 누적 잔액(이전월 포함)으로 계산", value=False, key="opt_cumulative")
+        show_only_mine = st.checkbox("내 기록만 보기", value=False, key="opt_only_mine")
+
+    if show_only_mine and len(month_ledger):
+        month_ledger = month_ledger[month_ledger["user"].fillna("").astype(str) == current_user()].copy()
 
     st.subheader("요약 (선택 월 기준)")
     income_sum = int(month_ledger.loc[month_ledger["type"] == "수입", "amount"].sum()) if len(month_ledger) else 0
@@ -936,6 +1012,8 @@ with tab_main:
         upto = ledger_df.copy()
         if len(upto):
             upto = upto[upto["date"] <= pd.Timestamp(end_date)].copy()
+        if show_only_mine and len(upto):
+            upto = upto[upto["user"].fillna("").astype(str) == current_user()].copy()
         income_upto = int(upto.loc[upto["type"] == "수입", "amount"].sum()) if len(upto) else 0
         expense_upto = int(upto.loc[upto["type"] == "지출", "amount"].sum()) if len(upto) else 0
         balance = income_upto - expense_upto
@@ -988,6 +1066,8 @@ with tab_main:
         month_ledger = month_ledger[
             (month_ledger["date"] >= pd.Timestamp(start_date)) & (month_ledger["date"] <= pd.Timestamp(end_date))
         ].copy()
+    if show_only_mine and len(month_ledger):
+        month_ledger = month_ledger[month_ledger["user"].fillna("").astype(str) == current_user()].copy()
 
     st.subheader("예산 현황 (실제 지출 대비 차액)")
     expense_month = month_ledger[(month_ledger["type"] == "지출") & (month_ledger["category"].isin(budget_categories))].copy()
@@ -1006,23 +1086,13 @@ with tab_main:
     cc1.metric("총 목표(예산)", f"{total_budget:,}원")
     cc2.metric("총 지출(선택월)", f"{total_spent:,}원")
     if total_diff < 0:
-        cc3.markdown(
-            f"**총 차액**  \n<span class='total-diff neg'>{total_diff:,}원</span>",
-            unsafe_allow_html=True
-        )
+        cc3.markdown(f"**총 차액**  \n<span class='total-diff neg'>{total_diff:,}원</span>", unsafe_allow_html=True)
     else:
-        cc3.markdown(
-            f"**총 차액**  \n<span class='total-diff'>{total_diff:,}원</span>",
-            unsafe_allow_html=True
-        )
+        cc3.markdown(f"**총 차액**  \n<span class='total-diff'>{total_diff:,}원</span>", unsafe_allow_html=True)
 
     show_df = budget_current[["category", "budget", "spent", "diff", "status"]].copy()
     show_df.columns = ["카테고리", "목표(원)", "실제지출(원)", "차액(원)", "상태"]
-    components.html(
-        render_budget_table_html(show_df),
-        height=dynamic_table_height(len(show_df)),
-        scrolling=True
-    )
+    components.html(render_budget_table_html(show_df), height=dynamic_table_height(len(show_df)), scrolling=True)
 
     st.divider()
 
@@ -1033,22 +1103,33 @@ with tab_main:
         view = month_ledger.copy()
         view["date"] = pd.to_datetime(view["date"], errors="coerce").dt.date
         view["amount_str"] = view["amount"].apply(money_str)
-        view = view[["id", "date", "type", "category", "amount_str", "memo"]].copy()
+
+        # user는 표시 안 해도 되지만, 공동사용이면 있으면 편해요(옵션)
+        show_user_col = st.checkbox("작성자 표시", value=False, key="show_user_col")
+        cols = ["id", "date", "type", "category", "amount_str", "memo"]
+        if show_user_col:
+            cols.append("user")
+
+        view = view[cols].copy()
         view.insert(0, "삭제", False)
         view = view.set_index("id")
+
+        column_config = {
+            "삭제": st.column_config.CheckboxColumn("삭제"),
+            "date": st.column_config.DateColumn("날짜"),
+            "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
+            "category": st.column_config.SelectboxColumn("카테고리", options=all_categories),
+            "amount_str": st.column_config.TextColumn("금액(원)"),
+            "memo": st.column_config.TextColumn("메모"),
+        }
+        if show_user_col:
+            column_config["user"] = st.column_config.TextColumn("작성자", disabled=True)
 
         edited = st.data_editor(
             view,
             hide_index=True,
             use_container_width=True,
-            column_config={
-                "삭제": st.column_config.CheckboxColumn("삭제"),
-                "date": st.column_config.DateColumn("날짜"),
-                "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
-                "category": st.column_config.SelectboxColumn("카테고리", options=all_categories),
-                "amount_str": st.column_config.TextColumn("금액(원)"),
-                "memo": st.column_config.TextColumn("메모"),
-            },
+            column_config=column_config,
             key="ledger_editor",
         )
 
@@ -1064,13 +1145,14 @@ with tab_main:
                 keep = ed[ed["삭제"] != True].copy()
                 keep["amount"] = keep["amount_str"].apply(lambda x: to_int_money(x, 0))
                 keep["date"] = pd.to_datetime(keep["date"], errors="coerce")
-                keep["memo"] = keep["memo"].fillna("")
+                keep["memo"] = keep.get("memo", "").fillna("")
                 keep["type"] = keep["type"].fillna("")
                 keep["category"] = keep["category"].fillna("")
 
                 updated = ledger_df.set_index("id").copy()
                 keep = keep.set_index("id")
                 common = updated.index.intersection(keep.index)
+
                 updated.loc[common, ["date", "type", "category", "amount", "memo"]] = keep.loc[
                     common, ["date", "type", "category", "amount", "memo"]
                 ].values
@@ -1078,8 +1160,8 @@ with tab_main:
                 if delete_ids:
                     updated = updated.drop(index=delete_ids, errors="ignore")
 
-                ledger_df = updated.reset_index()
-                save_ledger(ledger_df)
+                ledger_df2 = updated.reset_index()
+                save_ledger(ledger_df2)
                 clear_cache_and_rerun("저장되었습니다!")
 
         with col_b:
@@ -1090,8 +1172,8 @@ with tab_main:
                 if not delete_ids:
                     st.warning("삭제할 항목을 체크해 주세요.")
                 else:
-                    ledger_df = ledger_df[~ledger_df["id"].astype(str).isin(delete_ids)].copy()
-                    save_ledger(ledger_df)
+                    ledger_df2 = ledger_df[~ledger_df["id"].astype(str).isin(delete_ids)].copy()
+                    save_ledger(ledger_df2)
                     clear_cache_and_rerun(f"{len(delete_ids)}개 항목을 삭제했습니다.")
 
     st.divider()
@@ -1208,7 +1290,7 @@ with tab_fixed:
         clear_cache_and_rerun("고정지출이 저장되었습니다!")
 
 # ============================================================
-# 4) 경조사비/제로페이 탭
+# 4) 경조사비/제로페이 탭 (추가 저장은 append로 속도 개선)
 # ============================================================
 def simple_log_tab(title: str, ws_title: str, state_key: str):
     st.subheader(title)
@@ -1233,17 +1315,19 @@ def simple_log_tab(title: str, ws_title: str, state_key: str):
         memo = st.text_input("메모(선택)", value="", key=f"{state_key}_memo")
 
     if ok:
-        df = load_simple_money_log(ws_title)
         new_row = {
             "id": str(uuid.uuid4()),
-            "date": pd.Timestamp(d),
+            "date": str(d),
             "type": t,
             "amount": to_int_money(amt_str, 0),
-            "memo": memo
+            "memo": memo,
+            "user": current_user(),
         }
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        save_simple_money_log(ws_title, df)
+        ws_append_row(ws_title, new_row, SIMPLE_COLS)
         clear_cache_and_rerun("추가되었습니다!")
+
+    # 다시 로드
+    df = load_simple_money_log(ws_title)
 
     st.divider()
 
