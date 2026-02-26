@@ -2,32 +2,164 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 from datetime import date
-from pathlib import Path
 import uuid
 import calendar
 import re
-import os
-import tempfile
 from io import BytesIO
+import textwrap
 
+# ✅ Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ============================================================
 # 기본 설정
 # ============================================================
 st.set_page_config(page_title="가계부", layout="centered")
+
+# ============================================================
+# 🔐 로그인 (users가 있으면 아이디/비번, 없으면 기존 단일 비번)
+# ============================================================
+from collections.abc import Mapping
+
+PASSWORD = st.secrets.get("app", {}).get("password", "ab190427")  # fallback 단일 비번
+USERS = st.secrets.get("users", {})  # [users] 섹션이 없으면 {}
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "current_user" not in st.session_state:
+    st.session_state.current_user = ""
+
+def current_user() -> str:
+    u = str(st.session_state.current_user or "").strip()
+    return u if u else "me"
+
+def do_logout():
+    st.session_state.authenticated = False
+    st.session_state.current_user = ""
+    st.rerun()
+
+has_users = isinstance(USERS, Mapping) and len(USERS) > 0
+
+if not st.session_state.authenticated:
+    st.title("🔒 가계부 로그인")
+
+    if has_users:
+        username = st.text_input("아이디", value="", key="login_username")
+        pw = st.text_input("비밀번호", type="password", key="login_password")
+        login = st.button("로그인", use_container_width=True, key="login_btn")
+
+        if login:
+            if username in USERS and pw.strip() == str(USERS[username]).strip():
+                st.session_state.authenticated = True
+                st.session_state.current_user = username
+                st.success("로그인 성공!")
+                st.rerun()
+            else:
+                st.error("아이디/비밀번호가 틀렸어요.")
+    else:
+        pw = st.text_input("비밀번호를 입력하세요", type="password", key="login_password_only")
+        login = st.button("로그인", use_container_width=True, key="login_btn_only")
+
+        if login:
+            if pw.strip() == str(PASSWORD).strip():
+                st.session_state.authenticated = True
+                st.session_state.current_user = "me"
+                st.success("로그인 성공!")
+                st.rerun()
+            else:
+                st.error("비밀번호가 틀렸어요.")
+
+    st.stop()
+
 st.title("나의 가계부")
 
-BASE_DIR = Path(__file__).resolve().parent
+# ============================================================
+# Google Sheets 연결
+# ============================================================
+GSHEET_ID = st.secrets["gsheets"]["spreadsheet_id"]
+SA_INFO = dict(st.secrets["gcp_service_account"])
 
-DATA_FILE = BASE_DIR / "ledger.csv"
-BUDGET_FILE = BASE_DIR / "budgets_monthly.csv"
-FIXED_FILE = BASE_DIR / "fixed_expenses.csv"
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-EVENT_FILE = BASE_DIR / "events.csv"
-ZEROPAY_FILE = BASE_DIR / "zeropay.csv"
+@st.cache_resource(show_spinner=False)
+def gs_client():
+    creds = Credentials.from_service_account_info(SA_INFO, scopes=SCOPE)
+    return gspread.authorize(creds)
 
-CARDS_FILE = BASE_DIR / "cards.csv"
-CARD_SUBS_FILE = BASE_DIR / "card_subscriptions.csv"
+def get_spreadsheet():
+    return gs_client().open_by_key(GSHEET_ID)
+
+def get_or_create_worksheet(title: str, rows: int = 4000, cols: int = 40):
+    sh = get_spreadsheet()
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
+def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
+    ws = get_or_create_worksheet(ws_title)
+    values = ws.get_all_values()
+
+    if not values:
+        return pd.DataFrame(columns=columns)
+
+    header = values[0]
+    data = values[1:]
+
+    # 헤더가 비었거나 이상하면 강제로 columns 사용
+    if len(header) == 0 or all(str(h).strip() == "" for h in header):
+        header = columns
+
+    df = pd.DataFrame(data, columns=header[: len(header)])
+
+    # 누락 컬럼 보정
+    for c in columns:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df[columns].copy()
+
+def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
+    # ⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
+    ws = get_or_create_worksheet(ws_title)
+    out = df.copy()
+
+    for c in columns:
+        if c not in out.columns:
+            out[c] = ""
+
+    out = out[columns].fillna("")
+
+    values = [columns] + out.astype(str).values.tolist()
+    ws.clear()
+    ws.update(values)
+
+def ws_append_row(ws_title: str, row_dict: dict, columns: list[str]) -> None:
+    # ✅ 빠른 추가(append) 저장 (동시 입력에도 강함)
+    ws = get_or_create_worksheet(ws_title)
+
+    # 헤더 없으면 생성
+    existing = ws.get_all_values()
+    if not existing:
+        ws.update([columns])
+
+    row = []
+    for c in columns:
+        v = row_dict.get(c, "")
+        if v is None:
+            v = ""
+        row.append(str(v))
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+def clear_cache_and_rerun(msg: str | None = None):
+    st.cache_data.clear()
+    if msg:
+        st.success(msg)
+    st.rerun()
 
 # ============================================================
 # 카테고리
@@ -40,55 +172,170 @@ income_categories = ["월급", "부수입", "이자", "캐시백", "기타"]
 FIXED_CATEGORY = "9. 고정지출"
 LUMPSUM_CATEGORY = "10. 목돈지출"
 
-# 예산에 포함할 지출 카테고리 (고정지출/목돈지출 제외)
 budget_categories = [c for c in expense_categories if c not in [FIXED_CATEGORY, LUMPSUM_CATEGORY]]
 
-# ✅ 문자열 정렬(sorted) 대신 "의도한 순서" 유지
 all_categories = []
 for c in expense_categories + income_categories:
     if c not in all_categories:
         all_categories.append(c)
 
 # ============================================================
-# CSS (입력/숫자 오른쪽 정렬 + 총차액 폰트 고정)
+# CSS (기존 + 모바일 iOS 최적화 추가)
 # ============================================================
 st.markdown(
     """
     <style>
-      input { text-align: right; font-variant-numeric: tabular-nums; }
-
-      div[data-testid="stDataFrame"] table tbody tr td {
-        font-variant-numeric: tabular-nums;
+      :root{
+        --bg: #F2F2F7;
+        --card: rgba(255,255,255,0.92);
+        --card-border: rgba(60,60,67,0.12);
+        --text: #111111;
+        --subtext: rgba(60,60,67,0.72);
+        --accent: #0A84FF;
+        --danger: #FF3B30;
+        --danger-soft: rgba(255,59,48,0.12);
+        --shadow: 0 10px 24px rgba(0,0,0,0.06);
+        --radius: 18px;
       }
 
+      @media (prefers-color-scheme: dark) {
+        :root{
+          --bg: #000000;
+          --card: rgba(28,28,30,0.92);
+          --card-border: rgba(255,255,255,0.12);
+          --text: #FFFFFF;
+          --subtext: rgba(235,235,245,0.65);
+          --accent: #0A84FF;
+          --danger: #FF453A;
+          --danger-soft: rgba(255,69,58,0.18);
+          --shadow: 0 10px 24px rgba(0,0,0,0.45);
+        }
+      }
+
+      .stApp { background: var(--bg); color: var(--text); }
+
+      html, body, [class*="css"]  {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+                     "Apple SD Gothic Neo", "Noto Sans KR", Segoe UI, Roboto, Arial, sans-serif;
+        letter-spacing: -0.2px;
+      }
+
+      section.main > div { max-width: 920px; padding-top: 0.25rem; }
+
+      h1, h2, h3 { color: var(--text); letter-spacing: -0.4px; }
+      .stCaption, .stMarkdown p, .stMarkdown span { color: var(--subtext); }
+
+      div[data-testid="stVerticalBlockBorderWrapper"]{
+        background: var(--card);
+        border: 1px solid var(--card-border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        padding: 14px 16px;
+      }
+
+      input, textarea {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        border-radius: 14px !important;
+      }
+      div[data-baseweb="select"] > div { border-radius: 14px !important; }
+
+      .stButton > button, .stDownloadButton > button {
+        border-radius: 14px !important;
+        border: 1px solid var(--card-border) !important;
+        background: var(--card) !important;
+        color: var(--text) !important;
+        box-shadow: 0 6px 16px rgba(0,0,0,0.06);
+        transition: transform 0.06s ease, opacity 0.12s ease;
+      }
+      .stButton > button:hover, .stDownloadButton > button:hover {
+        transform: translateY(-1px);
+        opacity: 0.96;
+        border-color: rgba(10,132,255,0.35) !important;
+      }
+
+      div[data-testid="stTabs"] button {
+        border-radius: 999px !important;
+        padding: 8px 14px !important;
+      }
+
+      div[data-testid="stDataFrame"] table tbody tr td,
       div[data-testid="stDataEditor"] div[role="row"] > div[role="gridcell"]{
         font-variant-numeric: tabular-nums;
       }
 
-      .total-diff {
-        font-size: 2.2rem;
-        font-weight: 700;
-        font-variant-numeric: tabular-nums;
-      }
-      .total-diff.neg { color: #d11; }
-    
+      hr { border-color: rgba(60,60,67,0.16) !important; }
 
-      /* ✅ Tabs sticky (keep visible while scrolling) */
-      div[data-testid="stTabs"]{
-        position: sticky;
-        top: 0.35rem;
-        z-index: 999;
-        background: var(--bg, #f7f7fb);
-        padding-top: 0.25rem;
-        padding-bottom: 0.25rem;
+      .total-diff {
+        font-size: 2.1rem;
+        font-weight: 750;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.6px;
+        color: var(--text);
       }
-      @supports ((-webkit-backdrop-filter: blur(10px)) or (backdrop-filter: blur(10px))) {
-        div[data-testid="stTabs"]{
-          -webkit-backdrop-filter: blur(12px);
-          backdrop-filter: blur(12px);
+      .total-diff.neg { color: var(--danger); }
+
+      .ios-metric-grid{
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      @media (max-width: 720px) {
+        .ios-metric-grid{ grid-template-columns: 1fr; }
+      }
+      .ios-card{
+        background: var(--card);
+        border: 1px solid var(--card-border);
+        border-radius: 18px;
+        box-shadow: var(--shadow);
+        padding: 14px 14px;
+        overflow: hidden;
+      }
+      .ios-label{
+        font-size: 0.86rem;
+        font-weight: 650;
+        color: var(--subtext);
+        letter-spacing: -0.2px;
+        margin-bottom: 6px;
+      }
+      .ios-value{
+        font-size: 1.55rem;
+        font-weight: 800;
+        letter-spacing: -0.8px;
+        font-variant-numeric: tabular-nums;
+        color: var(--text);
+        line-height: 1.1;
+        margin-bottom: 6px;
+      }
+      .ios-help{
+        font-size: 0.82rem;
+        color: var(--subtext);
+        letter-spacing: -0.1px;
+      }
+      .ios-danger{ color: var(--danger); }
+
+      /* ===== Mobile iOS tuning (추가) ===== */
+      @media (max-width: 720px){
+        section.main > div { padding-left: 10px; padding-right: 10px; }
+        h1 { font-size: 1.35rem; }
+        h2 { font-size: 1.15rem; }
+        h3 { font-size: 1.05rem; }
+
+        /* iOS 입력 줌 방지 */
+        input, textarea { font-size: 16px !important; }
+
+        /* Tabs touch */
+        div[data-testid="stTabs"] button{
+          padding: 10px 12px !important;
+          font-size: 0.95rem !important;
+        }
+
+        /* Buttons touch */
+        .stButton > button, .stDownloadButton > button{
+          padding: 12px 14px !important;
+          font-size: 1rem !important;
         }
       }
-
     </style>
     """,
     unsafe_allow_html=True
@@ -148,46 +395,98 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
+def dynamic_table_height(n_rows: int, base: int = 130, row_h: int = 36, min_h: int = 240, max_h: int = 700) -> int:
+    h = base + n_rows * row_h
+    return max(min_h, min(max_h, h))
+
+def safe_key_part(s: str) -> str:
+    s = str(s).strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^0-9A-Za-z가-힣_\-]", "", s)
+    return s[:60] if len(s) > 60 else s
+
+def render_ios_summary_cards(items: list[dict]) -> str:
+    cards = []
+    for it in items:
+        label = html_escape(it.get("label", ""))
+        value = html_escape(it.get("value", ""))
+        help_ = html_escape(it.get("help", ""))
+        tone = it.get("tone", "normal")
+        value_cls = "ios-value ios-danger" if tone == "danger" else "ios-value"
+        cards.append(
+            f"""<div class="ios-card">
+  <div class="ios-label">{label}</div>
+  <div class="{value_cls}">{value}</div>
+  <div class="ios-help">{help_}</div>
+</div>"""
+        )
+
+    html = f"""<div class="ios-metric-grid">
+{''.join(cards)}
+</div>"""
+    return textwrap.dedent(html).strip()
+
 def render_budget_table_html(df: pd.DataFrame) -> str:
     style = """
     <style>
       :root{
-        --tbl-text: rgba(17,17,17,1);
-        --tbl-border: rgba(49, 51, 63, 0.20);
-        --tbl-head-bg: rgba(49, 51, 63, 0.06);
-        --tbl-cell-bg: rgba(255,255,255,1);
+        --tbl-bg: rgba(255,255,255,0.92);
+        --tbl-border: rgba(60,60,67,0.12);
+        --tbl-head-bg: rgba(60,60,67,0.06);
+        --tbl-text: #111;
+        --tbl-sub: rgba(60,60,67,0.72);
+        --danger: #FF3B30;
+        --danger-soft: rgba(255,59,48,0.12);
+        --radius: 16px;
+        --shadow: 0 10px 22px rgba(0,0,0,0.05);
       }
       @media (prefers-color-scheme: dark) {
         :root{
-          --tbl-text: rgba(240,240,240,1);
-          --tbl-border: rgba(255,255,255,0.18);
+          --tbl-bg: rgba(28,28,30,0.92);
+          --tbl-border: rgba(255,255,255,0.12);
           --tbl-head-bg: rgba(255,255,255,0.08);
-          --tbl-cell-bg: rgba(20,20,20,1);
+          --tbl-text: #fff;
+          --tbl-sub: rgba(235,235,245,0.65);
+          --danger: #FF453A;
+          --danger-soft: rgba(255,69,58,0.18);
+          --shadow: 0 14px 26px rgba(0,0,0,0.45);
         }
       }
+
       .budget-table-wrap { width: 100%; overflow-x: auto; }
       table.budget-table {
         width: 100%;
-        border-collapse: collapse;
+        border-collapse: separate;
+        border-spacing: 0;
         font-variant-numeric: tabular-nums;
         color: var(--tbl-text);
-        background: var(--tbl-cell-bg);
+        background: var(--tbl-bg);
+        border: 1px solid var(--tbl-border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        overflow: hidden;
       }
       table.budget-table th, table.budget-table td {
-        border: 1px solid var(--tbl-border);
-        padding: 8px 10px;
+        border-bottom: 1px solid var(--tbl-border);
+        padding: 10px 12px;
         font-size: 0.95rem;
         white-space: nowrap;
-        background: var(--tbl-cell-bg);
+        background: transparent;
       }
+      table.budget-table tr:last-child td { border-bottom: none; }
+
       table.budget-table th {
         background: var(--tbl-head-bg);
         text-align: left;
         font-weight: 700;
+        color: var(--tbl-sub);
       }
+
       td.num { text-align: right; }
-      td.diff-neg { color: #d11; font-weight: 800; }
-      td.diff-pos { font-weight: 600; }
+      td.diff-neg { color: var(--danger); font-weight: 800; }
+      td.diff-pos { font-weight: 650; }
+
+      tr.overspent td{ background: var(--danger-soft); }
     </style>
     """
 
@@ -199,13 +498,15 @@ def render_budget_table_html(df: pd.DataFrame) -> str:
         diff = int(pd.to_numeric(r["차액(원)"], errors="coerce") or 0)
         status = html_escape(r["상태"])
         diff_class = "diff-neg" if diff < 0 else "diff-pos"
+        tr_class = "overspent" if diff < 0 else ""
         rows_html.append(
             f"""
-            <tr>
+            <tr class="{tr_class}">
               <td>{cat}</td>
               <td class="num">{budget:,}</td>
               <td class="num">{spent:,}</td>
               <td class="num {diff_class}">{diff:,}</td>
+              <td>{status}</td>
             </tr>
             """
         )
@@ -220,6 +521,7 @@ def render_budget_table_html(df: pd.DataFrame) -> str:
             <th>목표(원)</th>
             <th>실제지출(원)</th>
             <th>차액(원)</th>
+            <th>상태</th>
           </tr>
         </thead>
         <tbody>
@@ -229,78 +531,47 @@ def render_budget_table_html(df: pd.DataFrame) -> str:
     </div>
     """
 
-def dynamic_table_height(n_rows: int, base: int = 110, row_h: int = 34, min_h: int = 220, max_h: int = 650) -> int:
-    h = base + n_rows * row_h
-    return max(min_h, min(max_h, h))
+# ============================================================
+# ✅ Sheets "테이블" 컬럼 정의 (공동사용: user 추가)
+# ============================================================
+LEDGER_COLS = ["id", "date", "type", "category", "amount", "memo", "fixed_key", "user"]
+BUDGET_COLS = ["year", "month", "category", "budget"]
+FIXED_COLS = ["fixed_id", "name", "amount", "day", "memo"]
+SIMPLE_COLS = ["id", "date", "type", "amount", "memo", "user"]
+CARDS_COLS = ["card_name", "benefits"]
+CARD_SUBS_COLS = ["card_name", "merchant", "amount", "day", "memo"]
 
-def safe_key_part(s: str) -> str:
-    # fixed_key에 들어갈 문자열을 안전하게 축약/정규화
-    s = str(s)
-    s = s.strip()
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^0-9A-Za-z가-힣_\-]", "", s)
-    return s[:60] if len(s) > 60 else s
+def current_user() -> str:
+    u = str(st.session_state.current_user or "").strip()
+    return u if u else "me"
 
 # ============================================================
-# 공통 CSV (원자적 저장)
+# 로드/저장 (Sheets)
 # ============================================================
-def atomic_to_csv(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), suffix=".tmp", newline="", encoding="utf-8") as f:
-        tmp_name = f.name
-        df.to_csv(f, index=False)
-    os.replace(tmp_name, path)
-
-def load_table(path: Path, columns: list[str]) -> pd.DataFrame:
-    if path.exists():
-        df = pd.read_csv(path)
-        for c in columns:
-            if c not in df.columns:
-                df[c] = ""
-        return df[columns].copy()
-    return pd.DataFrame(columns=columns)
-
-def save_table(path: Path, df: pd.DataFrame) -> None:
-    atomic_to_csv(df, path)
-
-def clear_cache_and_rerun(msg: str | None = None):
-    st.cache_data.clear()
-    if msg:
-        st.success(msg)
-    st.rerun()
-
-# ============================================================
-# 가계부 로드/저장
-# ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=20)
 def load_ledger() -> pd.DataFrame:
-    if DATA_FILE.exists():
-        df = pd.read_csv(DATA_FILE)
-        for col in ["date", "type", "category", "amount", "memo"]:
-            if col not in df.columns:
-                df[col] = "" if col != "amount" else 0
-        if "id" not in df.columns:
-            df.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(df))])
-        if "fixed_key" not in df.columns:
-            df["fixed_key"] = ""
+    df = ws_read_df("ledger", LEDGER_COLS)
 
+    if len(df):
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["memo"] = df["memo"].fillna("")
         df["type"] = df["type"].fillna("")
         df["category"] = df["category"].fillna("")
         df["fixed_key"] = df["fixed_key"].fillna("").astype(str)
+        df["user"] = df["user"].fillna("").astype(str)
 
-        save_ledger(df)
-        return df[["id", "date", "type", "category", "amount", "memo", "fixed_key"]]
-    return pd.DataFrame(columns=["id", "date", "type", "category", "amount", "memo", "fixed_key"])
+    if "id" not in df.columns:
+        df.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(df))])
+
+    # ⚠️ 여기서 save_ledger(df) 자동 호출은 "로드 시 덮어쓰기"라 불필요한 느려짐의 원인이라 제거
+    return df[LEDGER_COLS].copy()
 
 def save_ledger(df: pd.DataFrame) -> None:
     out = df.copy()
-    if "id" not in out.columns:
-        out.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(df))])
-    if "fixed_key" not in out.columns:
-        out["fixed_key"] = ""
+    for c in LEDGER_COLS:
+        if c not in out.columns:
+            out[c] = "" if c not in ["amount"] else 0
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
@@ -308,18 +579,19 @@ def save_ledger(df: pd.DataFrame) -> None:
     out["type"] = out["type"].fillna("")
     out["category"] = out["category"].fillna("")
     out["fixed_key"] = out["fixed_key"].fillna("").astype(str)
+    out["user"] = out["user"].fillna("").astype(str)
 
-    atomic_to_csv(out[["id", "date", "type", "category", "amount", "memo", "fixed_key"]], DATA_FILE)
+    ws_write_df("ledger", out[LEDGER_COLS], LEDGER_COLS)
 
 # ============================================================
-# ✅ 고정지출 월별 반영 (중복 방지)
+# ✅ 고정지출/정기결제 반영 (user도 포함)
 # ============================================================
 def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFrame, year: int, month: int):
     if fixed_df is None or len(fixed_df) == 0:
         return ledger_df, 0
 
     out = ledger_df.copy()
-    for col in ["id", "date", "type", "category", "amount", "memo", "fixed_key"]:
+    for col in LEDGER_COLS:
         if col not in out.columns:
             out[col] = "" if col != "amount" else 0
 
@@ -356,7 +628,8 @@ def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFr
             "category": FIXED_CATEGORY,
             "amount": amount,
             "memo": f"[고정지출] {full_memo}".strip(),
-            "fixed_key": key
+            "fixed_key": key,
+            "user": current_user(),
         })
 
     if not add_rows:
@@ -365,15 +638,12 @@ def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFr
     out = pd.concat([out, pd.DataFrame(add_rows)], ignore_index=True)
     return out, len(add_rows)
 
-# ============================================================
-# ✅ 정기결제 월별 반영 (중복 방지)
-# ============================================================
 def apply_subs_to_ledger_for_month(ledger_df: pd.DataFrame, subs_df: pd.DataFrame, year: int, month: int):
     if subs_df is None or len(subs_df) == 0:
         return ledger_df, 0
 
     out = ledger_df.copy()
-    for col in ["id", "date", "type", "category", "amount", "memo", "fixed_key"]:
+    for col in LEDGER_COLS:
         if col not in out.columns:
             out[col] = "" if col != "amount" else 0
 
@@ -415,7 +685,8 @@ def apply_subs_to_ledger_for_month(ledger_df: pd.DataFrame, subs_df: pd.DataFram
             "category": FIXED_CATEGORY,
             "amount": amount,
             "memo": full_memo,
-            "fixed_key": key
+            "fixed_key": key,
+            "user": current_user(),
         })
 
     if not add_rows:
@@ -425,23 +696,20 @@ def apply_subs_to_ledger_for_month(ledger_df: pd.DataFrame, subs_df: pd.DataFram
     return out, len(add_rows)
 
 # ============================================================
-# 월별 예산 로드/저장
+# 예산/고정/경조사/제로페이/카드
 # ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def load_budget_month(expense_cats: list[str], year: int, month: int) -> pd.DataFrame:
-    if BUDGET_FILE.exists():
-        bdf_all = pd.read_csv(BUDGET_FILE)
-        for col in ["year", "month", "category", "budget"]:
-            if col not in bdf_all.columns:
-                bdf_all = pd.DataFrame(columns=["year", "month", "category", "budget"])
-                break
-    else:
-        bdf_all = pd.DataFrame(columns=["year", "month", "category", "budget"])
+    bdf_all = ws_read_df("budgets_monthly", BUDGET_COLS)
 
     if len(bdf_all):
+        bdf_all["year"] = pd.to_numeric(bdf_all["year"], errors="coerce").fillna(0).astype(int)
+        bdf_all["month"] = pd.to_numeric(bdf_all["month"], errors="coerce").fillna(0).astype(int)
+        bdf_all["budget"] = pd.to_numeric(bdf_all["budget"], errors="coerce").fillna(0).astype(int)
+        bdf_all["category"] = bdf_all["category"].fillna("").astype(str).str.strip()
         bdf = bdf_all[(bdf_all["year"] == year) & (bdf_all["month"] == month)].copy()
     else:
-        bdf = pd.DataFrame()
+        bdf = pd.DataFrame(columns=["category", "budget"])
 
     if len(bdf) == 0:
         bdf = pd.DataFrame({"category": expense_cats, "budget": 0})
@@ -467,42 +735,24 @@ def save_budget_month(bdf_month: pd.DataFrame, year: int, month: int) -> None:
     out_month["budget"] = pd.to_numeric(out_month["budget"], errors="coerce").fillna(0).astype(int)
     out_month["year"] = year
     out_month["month"] = month
-    out_month = out_month[["year", "month", "category", "budget"]]
+    out_month = out_month[BUDGET_COLS].copy()
 
-    if BUDGET_FILE.exists():
-        bdf_all = pd.read_csv(BUDGET_FILE)
-        for col in ["year", "month", "category", "budget"]:
-            if col not in bdf_all.columns:
-                bdf_all = pd.DataFrame(columns=["year", "month", "category", "budget"])
-                break
-    else:
-        bdf_all = pd.DataFrame(columns=["year", "month", "category", "budget"])
-
+    bdf_all = ws_read_df("budgets_monthly", BUDGET_COLS)
     if len(bdf_all):
+        bdf_all["year"] = pd.to_numeric(bdf_all["year"], errors="coerce").fillna(0).astype(int)
+        bdf_all["month"] = pd.to_numeric(bdf_all["month"], errors="coerce").fillna(0).astype(int)
         bdf_all = bdf_all[~((bdf_all["year"] == year) & (bdf_all["month"] == month))].copy()
 
     merged = pd.concat([bdf_all, out_month], ignore_index=True)
-    merged["year"] = pd.to_numeric(merged["year"], errors="coerce").fillna(0).astype(int)
-    merged["month"] = pd.to_numeric(merged["month"], errors="coerce").fillna(0).astype(int)
-    merged["budget"] = pd.to_numeric(merged["budget"], errors="coerce").fillna(0).astype(int)
-    merged["category"] = merged["category"].fillna("").astype(str).str.strip()
+    ws_write_df("budgets_monthly", merged, BUDGET_COLS)
 
-    atomic_to_csv(merged, BUDGET_FILE)
-
-# ============================================================
-# 고정지출 로드/저장 (fixed_id 유지)
-# ============================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def load_fixed() -> pd.DataFrame:
-    if FIXED_FILE.exists():
-        fdf = pd.read_csv(FIXED_FILE)
-        for col in ["fixed_id", "name", "amount", "day", "memo"]:
-            if col not in fdf.columns:
-                fdf[col] = 0 if col in ["amount", "day"] else ""
-        fdf = fdf[["fixed_id", "name", "amount", "day", "memo"]].copy()
+    fdf = ws_read_df("fixed_expenses", FIXED_COLS)
 
+    if len(fdf):
         fdf["fixed_id"] = fdf["fixed_id"].fillna("").astype(str)
-        mask = (fdf["fixed_id"] == "")
+        mask = (fdf["fixed_id"].str.strip() == "")
         if mask.any():
             fdf.loc[mask, "fixed_id"] = [str(uuid.uuid4()) for _ in range(mask.sum())]
 
@@ -510,16 +760,14 @@ def load_fixed() -> pd.DataFrame:
         fdf["day"] = pd.to_numeric(fdf["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
         fdf["memo"] = fdf["memo"].fillna("")
         fdf["name"] = fdf["name"].fillna("")
-
-        save_fixed(fdf)
         return fdf.reset_index(drop=True)
 
-    return pd.DataFrame(columns=["fixed_id", "name", "amount", "day", "memo"])
+    return pd.DataFrame(columns=FIXED_COLS)
 
 def save_fixed(fdf: pd.DataFrame) -> None:
     out = fdf.copy()
 
-    for col in ["fixed_id", "name", "amount", "day", "memo"]:
+    for col in FIXED_COLS:
         if col not in out.columns:
             out[col] = "" if col in ["fixed_id", "name", "memo"] else 0
 
@@ -534,46 +782,36 @@ def save_fixed(fdf: pd.DataFrame) -> None:
     out["day"] = pd.to_numeric(out["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
 
     out = out[out["name"].str.strip() != ""].copy()
-    atomic_to_csv(out[["fixed_id", "name", "amount", "day", "memo"]], FIXED_FILE)
+    ws_write_df("fixed_expenses", out[FIXED_COLS], FIXED_COLS)
 
-# ============================================================
-# 경조사비/제로페이 로드/저장
-# ============================================================
-@st.cache_data(show_spinner=False)
-def load_simple_money_log(path: Path) -> pd.DataFrame:
-    df = load_table(path, ["id", "date", "type", "amount", "memo"])
+@st.cache_data(show_spinner=False, ttl=20)
+def load_simple_money_log(ws_title: str) -> pd.DataFrame:
+    df = ws_read_df(ws_title, SIMPLE_COLS)
     if len(df):
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["type"] = df["type"].fillna("")
         df["memo"] = df["memo"].fillna("")
+        df["user"] = df["user"].fillna("").astype(str)
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
     return df
 
-def save_simple_money_log(path: Path, df: pd.DataFrame) -> None:
+def save_simple_money_log(ws_title: str, df: pd.DataFrame) -> None:
     out = df.copy()
-    if "id" not in out.columns:
-        out.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(out))])
+    for c in SIMPLE_COLS:
+        if c not in out.columns:
+            out[c] = "" if c != "amount" else 0
+
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
     out["type"] = out["type"].fillna("")
     out["memo"] = out["memo"].fillna("")
+    out["user"] = out["user"].fillna("").astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
-    save_table(path, out[["id", "date", "type", "amount", "memo"]])
 
-# ============================================================
-# 카드
-# ============================================================
-@st.cache_data(show_spinner=False)
+    ws_write_df(ws_title, out[SIMPLE_COLS], SIMPLE_COLS)
+
+@st.cache_data(show_spinner=False, ttl=120)
 def load_cards() -> pd.DataFrame:
-    if CARDS_FILE.exists():
-        df = pd.read_csv(CARDS_FILE)
-        if "card_name" not in df.columns:
-            df["card_name"] = ""
-        if "benefits" not in df.columns:
-            df["benefits"] = ""
-        df = df[["card_name", "benefits"]].copy()
-    else:
-        df = pd.DataFrame(columns=["card_name", "benefits"])
-
+    df = ws_read_df("cards", CARDS_COLS)
     df["card_name"] = df["card_name"].fillna("").astype(str)
     df["benefits"] = df["benefits"].fillna("").astype(str)
     df = df[df["card_name"].str.strip() != ""].copy()
@@ -584,21 +822,11 @@ def save_cards(df: pd.DataFrame) -> None:
     out["card_name"] = out["card_name"].fillna("").astype(str)
     out["benefits"] = out["benefits"].fillna("").astype(str)
     out = out[out["card_name"].str.strip() != ""].copy()
-    save_table(CARDS_FILE, out[["card_name", "benefits"]])
+    ws_write_df("cards", out[CARDS_COLS], CARDS_COLS)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def load_card_subs() -> pd.DataFrame:
-    if CARD_SUBS_FILE.exists():
-        df = pd.read_csv(CARD_SUBS_FILE)
-        if "card_name" not in df.columns: df["card_name"] = ""
-        if "merchant" not in df.columns: df["merchant"] = ""
-        if "amount" not in df.columns: df["amount"] = 0
-        if "day" not in df.columns: df["day"] = 1
-        if "memo" not in df.columns: df["memo"] = ""
-        df = df[["card_name", "merchant", "amount", "day", "memo"]].copy()
-    else:
-        df = pd.DataFrame(columns=["card_name", "merchant", "amount", "day", "memo"])
-
+    df = ws_read_df("card_subscriptions", CARD_SUBS_COLS)
     df["card_name"] = df["card_name"].fillna("").astype(str)
     df["merchant"] = df["merchant"].fillna("").astype(str)
     df["memo"] = df["memo"].fillna("").astype(str)
@@ -609,19 +837,21 @@ def load_card_subs() -> pd.DataFrame:
 
 def save_card_subs(df: pd.DataFrame) -> None:
     out = df.copy()
-    for col in ["card_name", "merchant", "amount", "day", "memo"]:
+    for col in CARD_SUBS_COLS:
         if col not in out.columns:
             out[col] = "" if col in ["card_name", "merchant", "memo"] else 0
+
     out["card_name"] = out["card_name"].fillna("").astype(str)
     out["merchant"] = out["merchant"].fillna("").astype(str)
     out["memo"] = out["memo"].fillna("").astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
     out["day"] = pd.to_numeric(out["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
+
     out = out[out["merchant"].str.strip() != ""].copy()
-    save_table(CARD_SUBS_FILE, out[["card_name", "merchant", "amount", "day", "memo"]])
+    ws_write_df("card_subscriptions", out[CARD_SUBS_COLS], CARD_SUBS_COLS)
 
 # ============================================================
-# 엑셀 다운로드 생성 (✅ 다운로드용 불필요 컬럼 제거 + date 포맷 강제)
+# 엑셀 다운로드 (user는 제외해도 됨 — 원래 느낌 유지)
 # ============================================================
 def make_excel_bytes(
     selected_year: int,
@@ -646,56 +876,39 @@ def make_excel_bytes(
     month_event = month_filter(event_df, "date")
     month_zeropay = month_filter(zeropay_df, "date")
 
-    # ----------------------------
-    # 요약 시트
-    # ----------------------------
     inc = int(month_ledger.loc[month_ledger["type"] == "수입", "amount"].sum()) if len(month_ledger) else 0
     exp = int(month_ledger.loc[month_ledger["type"] == "지출", "amount"].sum()) if len(month_ledger) else 0
     bal = inc - exp
     summary = pd.DataFrame([{"연도": selected_year, "월": selected_month, "수입합계": inc, "지출합계": exp, "차액": bal}])
 
-    # ----------------------------
-    # 예산 현황 (선택월)
-    # ----------------------------
     exp_month = month_ledger[month_ledger["type"] == "지출"].copy() if len(month_ledger) else pd.DataFrame(columns=month_ledger.columns)
     spent_by_cat = exp_month.groupby("category")["amount"].sum().to_dict() if len(exp_month) else {}
+
     b = budget_df.copy()
     b["spent"] = b["category"].map(spent_by_cat).fillna(0).astype(int)
     b["diff"] = (b["budget"] - b["spent"]).astype(int)
     b["status"] = b["diff"].apply(lambda x: "남음" if x >= 0 else "초과")
     budget_status = b.rename(columns={"category": "카테고리", "budget": "목표(원)", "spent": "실제지출(원)", "diff": "차액(원)", "status": "상태"})
 
-    # ----------------------------
-    # ✅ 가계부(선택월) : id/fixed_key 제거 + date 포맷
-    # ----------------------------
     if len(month_ledger):
         out_ledger = month_ledger.copy()
         out_ledger["date"] = pd.to_datetime(out_ledger["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("0000-00-00")
-        out_ledger = out_ledger.drop(columns=["id", "fixed_key"], errors="ignore")
+        out_ledger = out_ledger.drop(columns=["id", "fixed_key", "user"], errors="ignore")
         out_ledger = out_ledger.sort_values("date")
     else:
-        out_ledger = month_ledger.drop(columns=["id", "fixed_key"], errors="ignore")
+        out_ledger = month_ledger.drop(columns=["id", "fixed_key", "user"], errors="ignore")
 
-    # ----------------------------
-    # ✅ 고정지출(설정) : fixed_id 제거
-    # ----------------------------
     fixed_clean = fixed_df.drop(columns=["fixed_id"], errors="ignore")
 
-    # ----------------------------
-    # ✅ 경조사비(선택월) : id 제거 + date 포맷(결측은 0000-00-00)
-    # ----------------------------
     if len(month_event):
         month_event = month_event.copy()
         month_event["date"] = pd.to_datetime(month_event["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("0000-00-00")
-        month_event = month_event.drop(columns=["id"], errors="ignore")
+        month_event = month_event.drop(columns=["id", "user"], errors="ignore")
 
-    # ----------------------------
-    # ✅ 제로페이(선택월) : id 제거 + date 포맷(결측은 0000-00-00)
-    # ----------------------------
     if len(month_zeropay):
         month_zeropay = month_zeropay.copy()
         month_zeropay["date"] = pd.to_datetime(month_zeropay["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("0000-00-00")
-        month_zeropay = month_zeropay.drop(columns=["id"], errors="ignore")
+        month_zeropay = month_zeropay.drop(columns=["id", "user"], errors="ignore")
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -709,6 +922,20 @@ def make_excel_bytes(
     return bio.getvalue()
 
 # ============================================================
+# 사이드바: 사용자/새로고침/로그아웃
+# ============================================================
+with st.sidebar:
+    st.markdown("### 👤 현재 로그인")
+    st.write(f"**{current_user()}**")
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        if st.button("새로고침", use_container_width=True):
+            clear_cache_and_rerun()
+    with col_s2:
+        if st.button("로그아웃", use_container_width=True):
+            do_logout()
+
+# ============================================================
 # 탭 구성
 # ============================================================
 tab_main, tab_budget, tab_fixed, tab_event, tab_zeropay, tab_card = st.tabs(
@@ -720,30 +947,43 @@ tab_main, tab_budget, tab_fixed, tab_event, tab_zeropay, tab_card = st.tabs(
 # ============================================================
 with tab_main:
     st.subheader("내역 입력")
-    entry_type = st.selectbox("구분", ["지출", "수입"], key="ledger_entry_type")
-    category_options = expense_categories if entry_type == "지출" else income_categories
 
-    with st.form("ledger_entry_form"):
-        entry_date = st.date_input("날짜", value=date.today(), key="ledger_date")
-        category = st.selectbox("카테고리", category_options, key="ledger_category")
-        amt_str = st.text_input("금액(원)", value="0", key="ledger_amount_str", help="예: 12,000")
+    with st.form("ledger_entry_form_horizontal"):
+        c_type, c_date, c_cat, c_amt, c_btn = st.columns([1.0, 1.25, 1.6, 1.0, 0.9])
+
+        with c_type:
+            entry_type = st.selectbox("구분", ["지출", "수입"], key="ledger_entry_type")
+
+        category_options = expense_categories if entry_type == "지출" else income_categories
+
+        with c_date:
+            entry_date = st.date_input("날짜", value=date.today(), key="ledger_date")
+
+        with c_cat:
+            category = st.selectbox("카테고리", category_options, key="ledger_category")
+
+        with c_amt:
+            amt_str = st.text_input("금액(원)", value="0", key="ledger_amount_str", help="예: 12,000")
+
+        with c_btn:
+            submitted = st.form_submit_button("추가", use_container_width=True)
+
         memo = st.text_input("메모(선택)", key="ledger_memo")
-        submitted = st.form_submit_button("추가")
 
+    # ✅ 여기서부터 속도 개선 핵심: append로 바로 저장
     if submitted:
-        ledger_df = load_ledger()
         amt = to_int_money(amt_str, 0)
         new_row = {
             "id": str(uuid.uuid4()),
-            "date": pd.Timestamp(entry_date),
+            "date": str(entry_date),   # "YYYY-MM-DD"
             "type": entry_type,
             "category": category,
             "amount": int(amt),
             "memo": memo,
-            "fixed_key": ""
+            "fixed_key": "",
+            "user": current_user(),
         }
-        ledger_df = pd.concat([ledger_df, pd.DataFrame([new_row])], ignore_index=True)
-        save_ledger(ledger_df)
+        ws_append_row("ledger", new_row, LEDGER_COLS)
         clear_cache_and_rerun("추가되었습니다!")
 
     st.divider()
@@ -754,8 +994,8 @@ with tab_main:
     ledger_df = load_ledger()
     fixed_df = load_fixed()
     subs_df = load_card_subs()
-    event_df = load_simple_money_log(EVENT_FILE)
-    zeropay_df = load_simple_money_log(ZEROPAY_FILE)
+    event_df = load_simple_money_log("events")
+    zeropay_df = load_simple_money_log("zeropay")
 
     start_date, end_date, _ = month_range(selected_year, selected_month)
     month_ledger = ledger_df.copy()
@@ -764,9 +1004,12 @@ with tab_main:
             (month_ledger["date"] >= pd.Timestamp(start_date)) & (month_ledger["date"] <= pd.Timestamp(end_date))
         ].copy()
 
-    # ✅ 누적 잔액(옵션)
     with st.expander("표시 옵션", expanded=False):
         show_cumulative = st.checkbox("월 누적 잔액(이전월 포함)으로 계산", value=False, key="opt_cumulative")
+        show_only_mine = st.checkbox("내 기록만 보기", value=False, key="opt_only_mine")
+
+    if show_only_mine and len(month_ledger):
+        month_ledger = month_ledger[month_ledger["user"].fillna("").astype(str) == current_user()].copy()
 
     st.subheader("요약 (선택 월 기준)")
     income_sum = int(month_ledger.loc[month_ledger["type"] == "수입", "amount"].sum()) if len(month_ledger) else 0
@@ -777,22 +1020,27 @@ with tab_main:
         upto = ledger_df.copy()
         if len(upto):
             upto = upto[upto["date"] <= pd.Timestamp(end_date)].copy()
+        if show_only_mine and len(upto):
+            upto = upto[upto["user"].fillna("").astype(str) == current_user()].copy()
         income_upto = int(upto.loc[upto["type"] == "수입", "amount"].sum()) if len(upto) else 0
         expense_upto = int(upto.loc[upto["type"] == "지출", "amount"].sum()) if len(upto) else 0
         balance = income_upto - expense_upto
         balance_label = "누적 잔액"
+        balance_help = "이전월 포함, 선택월 말 기준"
     else:
         balance = balance_month
         balance_label = "잔액"
+        balance_help = "선택월 기준 (수입-지출)"
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("수입 합계", f"{income_sum:,}원")
-    c2.metric("지출 합계", f"{expense_sum:,}원")
-    c3.metric(balance_label, f"{balance:,}원")
+    items = [
+        {"label": "수입 합계", "value": f"{income_sum:,}원", "help": "선택월 수입 합계"},
+        {"label": "지출 합계", "value": f"{expense_sum:,}원", "help": "선택월 지출 합계"},
+        {"label": balance_label, "value": f"{balance:,}원", "help": balance_help, "tone": "danger" if balance < 0 else "normal"},
+    ]
+    st.markdown(render_ios_summary_cards(items), unsafe_allow_html=True)
 
     st.divider()
 
-    # ✅ 월별 반영 버튼 (고정지출 / 정기결제)
     col_fx_a, col_fx_b, col_fx_c = st.columns([2, 1, 1])
     with col_fx_a:
         st.caption("고정지출/정기결제는 버튼을 눌러서 해당 월에만 반영할 수 있어요. (중복 반영 방지됨)")
@@ -820,15 +1068,15 @@ with tab_main:
                 st.info("추가로 반영할 정기결제가 없어요. (이미 반영되었을 수 있어요)")
                 st.rerun()
 
-    # 반영 후 최신 상태로 재계산
     ledger_df = load_ledger()
     month_ledger = ledger_df.copy()
     if len(month_ledger):
         month_ledger = month_ledger[
             (month_ledger["date"] >= pd.Timestamp(start_date)) & (month_ledger["date"] <= pd.Timestamp(end_date))
         ].copy()
+    if show_only_mine and len(month_ledger):
+        month_ledger = month_ledger[month_ledger["user"].fillna("").astype(str) == current_user()].copy()
 
-    # ✅ 예산 현황
     st.subheader("예산 현황 (실제 지출 대비 차액)")
     expense_month = month_ledger[(month_ledger["type"] == "지출") & (month_ledger["category"].isin(budget_categories))].copy()
     spent_by_cat = expense_month.groupby("category")["amount"].sum().to_dict() if len(expense_month) else {}
@@ -845,54 +1093,51 @@ with tab_main:
     cc1, cc2, cc3 = st.columns(3)
     cc1.metric("총 목표(예산)", f"{total_budget:,}원")
     cc2.metric("총 지출(선택월)", f"{total_spent:,}원")
-
     if total_diff < 0:
-        cc3.markdown(
-            f"**총 차액**  \n<span class='total-diff neg'>{total_diff:,}원</span>",
-            unsafe_allow_html=True
-        )
+        cc3.markdown(f"**총 차액**  \n<span class='total-diff neg'>{total_diff:,}원</span>", unsafe_allow_html=True)
     else:
-        cc3.markdown(
-            f"**총 차액**  \n<span class='total-diff'>{total_diff:,}원</span>",
-            unsafe_allow_html=True
-        )
+        cc3.markdown(f"**총 차액**  \n<span class='total-diff'>{total_diff:,}원</span>", unsafe_allow_html=True)
 
-    show_df = budget_current[["category", "budget", "spent", "diff"]].copy()
-    show_df.columns = ["카테고리", "목표(원)", "실제지출(원)", "차액(원)"]
-    components.html(
-        render_budget_table_html(show_df),
-        height=dynamic_table_height(len(show_df)),
-        scrolling=True
-    )
+    show_df = budget_current[["category", "budget", "spent", "diff", "status"]].copy()
+    show_df.columns = ["카테고리", "목표(원)", "실제지출(원)", "차액(원)", "상태"]
+    components.html(render_budget_table_html(show_df), height=dynamic_table_height(len(show_df)), scrolling=True)
 
     st.divider()
 
-    # ✅ 내역 편집/삭제
     st.subheader("내역 (선택 월 기준)")
     if len(month_ledger) == 0:
         st.info("선택한 월에는 기록이 없어요.")
     else:
         view = month_ledger.copy()
-        view["date"] = pd.to_datetime(view["date"], errors="coerce")
-        view["day"] = view["date"].dt.day.astype("Int64")
+        view["date"] = pd.to_datetime(view["date"], errors="coerce").dt.date
         view["amount_str"] = view["amount"].apply(money_str)
-        view = view[["id", "day", "type", "category", "amount_str", "memo"]].copy()
+
+        # user는 표시 안 해도 되지만, 공동사용이면 있으면 편해요(옵션)
+        show_user_col = st.checkbox("작성자 표시", value=False, key="show_user_col")
+        cols = ["id", "date", "type", "category", "amount_str", "memo"]
+        if show_user_col:
+            cols.append("user")
+
+        view = view[cols].copy()
         view.insert(0, "삭제", False)
         view = view.set_index("id")
+
+        column_config = {
+            "삭제": st.column_config.CheckboxColumn("삭제"),
+            "date": st.column_config.DateColumn("날짜"),
+            "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
+            "category": st.column_config.SelectboxColumn("카테고리", options=all_categories),
+            "amount_str": st.column_config.TextColumn("금액(원)"),
+            "memo": st.column_config.TextColumn("메모"),
+        }
+        if show_user_col:
+            column_config["user"] = st.column_config.TextColumn("작성자", disabled=True)
 
         edited = st.data_editor(
             view,
             hide_index=True,
             use_container_width=True,
-            height=dynamic_table_height(len(view)),
-            column_config={
-                "삭제": st.column_config.CheckboxColumn("삭제"),
-                "day": st.column_config.NumberColumn("일", min_value=1, max_value=31, step=1),
-                "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
-                "category": st.column_config.SelectboxColumn("카테고리", options=all_categories),
-                "amount_str": st.column_config.TextColumn("금액(원)"),
-                "memo": st.column_config.TextColumn("메모"),
-            },
+            column_config=column_config,
             key="ledger_editor",
         )
 
@@ -907,24 +1152,15 @@ with tab_main:
 
                 keep = ed[ed["삭제"] != True].copy()
                 keep["amount"] = keep["amount_str"].apply(lambda x: to_int_money(x, 0))
-                # '일' -> 선택월의 실제 날짜로 변환
-                _, _, _last = month_range(selected_year, selected_month)
-                def _make_date_from_day(x):
-                    try:
-                        d = int(pd.to_numeric(x, errors="coerce"))
-                    except Exception:
-                        d = 1
-                    d = max(1, min(d, _last))
-                    return pd.Timestamp(date(selected_year, selected_month, d))
-                keep["date"] = keep["day"].apply(_make_date_from_day)
-
-                keep["memo"] = keep["memo"].fillna("")
+                keep["date"] = pd.to_datetime(keep["date"], errors="coerce")
+                keep["memo"] = keep.get("memo", "").fillna("")
                 keep["type"] = keep["type"].fillna("")
                 keep["category"] = keep["category"].fillna("")
 
                 updated = ledger_df.set_index("id").copy()
                 keep = keep.set_index("id")
                 common = updated.index.intersection(keep.index)
+
                 updated.loc[common, ["date", "type", "category", "amount", "memo"]] = keep.loc[
                     common, ["date", "type", "category", "amount", "memo"]
                 ].values
@@ -932,8 +1168,8 @@ with tab_main:
                 if delete_ids:
                     updated = updated.drop(index=delete_ids, errors="ignore")
 
-                ledger_df = updated.reset_index()
-                save_ledger(ledger_df)
+                ledger_df2 = updated.reset_index()
+                save_ledger(ledger_df2)
                 clear_cache_and_rerun("저장되었습니다!")
 
         with col_b:
@@ -944,13 +1180,12 @@ with tab_main:
                 if not delete_ids:
                     st.warning("삭제할 항목을 체크해 주세요.")
                 else:
-                    ledger_df = ledger_df[~ledger_df["id"].astype(str).isin(delete_ids)].copy()
-                    save_ledger(ledger_df)
+                    ledger_df2 = ledger_df[~ledger_df["id"].astype(str).isin(delete_ids)].copy()
+                    save_ledger(ledger_df2)
                     clear_cache_and_rerun(f"{len(delete_ids)}개 항목을 삭제했습니다.")
 
     st.divider()
 
-    # ✅ 엑셀 다운로드 (요청대로 맨 아래로 이동)
     st.subheader("엑셀 다운로드")
     excel_bytes = make_excel_bytes(
         selected_year=selected_year,
@@ -986,7 +1221,6 @@ with tab_budget:
         bview,
         hide_index=True,
         use_container_width=True,
-        height=dynamic_table_height(len(view)),
         column_config={
             "category": st.column_config.TextColumn("카테고리", disabled=True),
             "budget_str": st.column_config.TextColumn("목표 금액(원)"),
@@ -1003,7 +1237,7 @@ with tab_budget:
         clear_cache_and_rerun(f"{budget_year}년 {budget_month}월 예산이 저장되었습니다!")
 
 # ============================================================
-# 3) 고정지출 탭 (fixed_id 컬럼 보존)
+# 3) 고정지출 탭
 # ============================================================
 with tab_fixed:
     st.subheader("고정지출 설정")
@@ -1019,39 +1253,36 @@ with tab_fixed:
             "memo": ""
         }])
 
-    # ✅ 총 고정지출 금액 표시
     total_fixed_amount = int(pd.to_numeric(fdf.get("amount", 0), errors="coerce").fillna(0).sum()) if len(fdf) else 0
     st.metric("고정지출 총 금액(설정)", f"{total_fixed_amount:,}원")
 
-    # ✅ ID는 내부적으로만 사용 (UI에는 표시하지 않음)
     original_ids = fdf["fixed_id"].astype(str).tolist()
 
     fview = fdf.copy()
     fview["amount_str"] = fview["amount"].apply(money_str)
-    fview = fview[["name", "amount_str", "day"]].copy()
+    fview = fview[["name", "amount_str", "day", "memo"]].copy()
 
     edited_fixed = st.data_editor(
         fview,
         hide_index=True,
         use_container_width=True,
-        height=dynamic_table_height(len(fview)),
         num_rows="dynamic",
         column_config={
             "name": st.column_config.TextColumn("이름"),
             "amount_str": st.column_config.TextColumn("금액(원)"),
             "day": st.column_config.NumberColumn("지출일(1~31)", min_value=1, max_value=31, step=1),
-            },
+            "memo": st.column_config.TextColumn("메모"),
+        },
         key="fixed_editor",
     )
 
     if st.button("고정지출 저장", key="fixed_save"):
         saved = edited_fixed.copy()
         saved["name"] = saved["name"].fillna("").astype(str)
-        saved["memo"] = ""
+        saved["memo"] = saved["memo"].fillna("").astype(str)
         saved["amount"] = saved["amount_str"].apply(lambda x: to_int_money(x, 0))
         saved["day"] = pd.to_numeric(saved["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
 
-        # 기존 ID 유지 + 새 행은 UUID 생성
         new_len = len(saved)
         fixed_ids = []
         for i in range(new_len):
@@ -1061,42 +1292,53 @@ with tab_fixed:
                 fixed_ids.append(str(uuid.uuid4()))
 
         saved.insert(0, "fixed_id", fixed_ids)
-        saved = saved[["fixed_id", "name", "amount", "day", "memo"]].copy()
+        saved = saved[FIXED_COLS].copy()
 
         save_fixed(saved)
         clear_cache_and_rerun("고정지출이 저장되었습니다!")
 
 # ============================================================
-# 4) 경조사비/제로페이 탭
+# 4) 경조사비/제로페이 탭 (추가 저장은 append로 속도 개선)
 # ============================================================
-def simple_log_tab(title: str, storage_path: Path, state_key: str):
+def simple_log_tab(title: str, ws_title: str, state_key: str):
     st.subheader(title)
 
-    df = load_simple_money_log(storage_path)
+    df = load_simple_money_log(ws_title)
 
     with st.form(f"{state_key}_form"):
-        d = st.date_input("날짜", value=date.today(), key=f"{state_key}_date")
-        t = st.selectbox("구분", ["지출", "수입"], key=f"{state_key}_type")
-        amt_str = st.text_input("금액(원)", value="0", key=f"{state_key}_amount_str", help="예: 50,000")
+        c_type, c_date, c_amt, c_btn = st.columns([1.0, 1.25, 1.2, 0.9])
+
+        with c_type:
+            t = st.selectbox("구분", ["지출", "수입"], key=f"{state_key}_type")
+
+        with c_date:
+            d = st.date_input("날짜", value=date.today(), key=f"{state_key}_date")
+
+        with c_amt:
+            amt_str = st.text_input("금액(원)", value="0", key=f"{state_key}_amount_str", help="예: 50,000")
+
+        with c_btn:
+            ok = st.form_submit_button("추가", use_container_width=True)
+
         memo = st.text_input("메모(선택)", value="", key=f"{state_key}_memo")
-        ok = st.form_submit_button("추가")
 
     if ok:
-        df = load_simple_money_log(storage_path)  # ✅ 추가 직전 최신 로드
         new_row = {
             "id": str(uuid.uuid4()),
-            "date": pd.Timestamp(d),
+            "date": str(d),
             "type": t,
             "amount": to_int_money(amt_str, 0),
-            "memo": memo
+            "memo": memo,
+            "user": current_user(),
         }
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        save_simple_money_log(storage_path, df)
+        ws_append_row(ws_title, new_row, SIMPLE_COLS)
         clear_cache_and_rerun("추가되었습니다!")
+
+    # 다시 로드
+    df = load_simple_money_log(ws_title)
 
     st.divider()
 
-    # ✅ 전체 요약(월 선택 없이 전체 데이터)
     income_sum = int(df.loc[df["type"] == "수입", "amount"].sum()) if len(df) else 0
     expense_sum = int(df.loc[df["type"] == "지출", "amount"].sum()) if len(df) else 0
     bal = income_sum - expense_sum
@@ -1114,10 +1356,9 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
         return
 
     view = df.copy()
-    view["date"] = pd.to_datetime(view["date"], errors="coerce")
-    view["day"] = view["date"].dt.day.astype("Int64")
+    view["date"] = pd.to_datetime(view["date"], errors="coerce").dt.date
     view["amount_str"] = view["amount"].apply(money_str)
-    view = view[["id", "day", "type", "amount_str", "memo"]].copy()
+    view = view[["id", "date", "type", "amount_str", "memo"]].copy()
     view.insert(0, "삭제", False)
     view = view.set_index("id")
 
@@ -1125,35 +1366,31 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
         view,
         hide_index=True,
         use_container_width=True,
-        height=dynamic_table_height(len(view)),
         column_config={
             "삭제": st.column_config.CheckboxColumn("삭제"),
-            "day": st.column_config.NumberColumn("일", min_value=1, max_value=31, step=1),
+            "date": st.column_config.DateColumn("날짜"),
             "type": st.column_config.SelectboxColumn("구분", options=["지출", "수입"]),
             "amount_str": st.column_config.TextColumn("금액(원)"),
-            },
+            "memo": st.column_config.TextColumn("메모"),
+        },
         key=f"{state_key}_editor",
     )
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
         if st.button("변경 저장", key=f"{state_key}_save"):
-            df = load_simple_money_log(storage_path)  # ✅ 저장 직전 최신 로드
+            df0 = load_simple_money_log(ws_title)
 
             ed = edited.reset_index()
             delete_ids = ed.loc[ed["삭제"] == True, "id"].astype(str).tolist()
 
             keep = ed[ed["삭제"] != True].copy()
             keep["amount"] = keep["amount_str"].apply(lambda x: to_int_money(x, 0))
-            # 날짜는 '일'만 표시(편집 비활성). 기존 날짜를 유지합니다.
-            orig_dates = df0.set_index("id")["date"]
-            keep["date"] = keep["id"].map(orig_dates)
             keep["date"] = pd.to_datetime(keep["date"], errors="coerce")
-
             keep["memo"] = keep["memo"].fillna("")
             keep["type"] = keep["type"].fillna("")
 
-            updated = df.set_index("id").copy()
+            updated = df0.set_index("id").copy()
             keep = keep.set_index("id")
             common = updated.index.intersection(keep.index)
             updated.loc[common, ["date", "type", "amount", "memo"]] = keep.loc[
@@ -1164,26 +1401,26 @@ def simple_log_tab(title: str, storage_path: Path, state_key: str):
                 updated = updated.drop(index=delete_ids, errors="ignore")
 
             df2 = updated.reset_index()
-            save_simple_money_log(storage_path, df2)
+            save_simple_money_log(ws_title, df2)
             clear_cache_and_rerun("저장되었습니다!")
 
     with col_b:
         if st.button("선택 삭제", key=f"{state_key}_delete"):
-            df = load_simple_money_log(storage_path)  # ✅ 삭제 직전 최신 로드
+            df0 = load_simple_money_log(ws_title)
             ed = edited.reset_index()
             delete_ids = ed.loc[ed["삭제"] == True, "id"].astype(str).tolist()
             if not delete_ids:
                 st.warning("삭제할 항목을 체크해 주세요.")
             else:
-                df2 = df[~df["id"].astype(str).isin(delete_ids)].copy()
-                save_simple_money_log(storage_path, df2)
+                df2 = df0[~df0["id"].astype(str).isin(delete_ids)].copy()
+                save_simple_money_log(ws_title, df2)
                 clear_cache_and_rerun(f"{len(delete_ids)}개 항목을 삭제했습니다.")
 
 with tab_event:
-    simple_log_tab("경조사비", EVENT_FILE, "event")
+    simple_log_tab("경조사비", "events", "event")
 
 with tab_zeropay:
-    simple_log_tab("제로페이", ZEROPAY_FILE, "zeropay")
+    simple_log_tab("제로페이", "zeropay", "zeropay")
 
 # ============================================================
 # 5) 신용카드 탭
@@ -1200,7 +1437,6 @@ with tab_card:
         cards_df,
         hide_index=True,
         use_container_width=True,
-        height=dynamic_table_height(len(fview)),
         num_rows="dynamic",
         column_config={
             "card_name": st.column_config.TextColumn("카드명"),
@@ -1265,13 +1501,13 @@ with tab_card:
         view,
         hide_index=True,
         use_container_width=True,
-        height=dynamic_table_height(len(fview)),
         num_rows="dynamic",
         column_config={
             "merchant": st.column_config.TextColumn("정기결제명"),
             "amount_str": st.column_config.TextColumn("금액(원)"),
             "day": st.column_config.NumberColumn("결제일", min_value=1, max_value=31, step=1),
-            },
+            "memo": st.column_config.TextColumn("메모"),
+        },
         key="subs_editor_no_active",
     )
 
@@ -1293,7 +1529,4 @@ with tab_card:
         save_card_subs(merged)
         clear_cache_and_rerun("저장되었습니다!")
 
-# ============================================================
-# Footer
-# ============================================================
 st.caption("Made by Gayoung")
