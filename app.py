@@ -94,34 +94,20 @@ def get_spreadsheet():
     return gs_client().open_by_key(GSHEET_ID)
 
 def get_or_create_worksheet(title: str, rows: int = 4000, cols: int = 40):
-    """Worksheet를 가져오되, '정말 없을 때만' 생성합니다.
-
-    기존 코드는 모든 예외를 잡고 add_worksheet를 시도해서,
-    일시적 API 오류/권한 문제/네트워크 오류가 발생해도 '없다'고 오판하여
-    중복 생성(또는 '이미 존재' 오류)을 유발할 수 있습니다.
+    """워크시트를 가져오고, '없을 때만' 생성합니다.
+    - WorksheetNotFound일 때만 add_worksheet 시도
+    - 기타 예외(APIError/권한/쿼터/네트워크 등)는 숨기지 않음
+    - 동시 생성 경쟁을 고려해 생성 실패 시 1회 재조회
     """
-    from gspread.exceptions import WorksheetNotFound, APIError
-
     sh = get_spreadsheet()
-
-    # 1) 정상적으로 존재하면 바로 반환
     try:
         return sh.worksheet(title)
-    except WorksheetNotFound:
-        pass  # 없으면 생성 시도
-    except APIError as e:
-        # API 자체 오류는 '시트 없음'이 아니므로 그대로 올려서 원인을 확인하게 함
-        raise
-    except Exception:
-        # 기타 예외도 '없음'으로 간주하지 않음
-        raise
-
-    # 2) 없을 때만 생성
-    try:
-        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
-    except APIError:
-        # 동시 실행 등으로 이미 누군가 생성했을 수 있으니 한 번 더 가져오기
-        return sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+        except Exception:
+            # 누군가가 동시에 만든 경우 등: 한 번 더 조회
+            return sh.worksheet(title)
 
 def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
     ws = get_or_create_worksheet(ws_title)
@@ -147,7 +133,7 @@ def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
     return df[columns].copy()
 
 def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
-    #⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
+    # ⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
     ws = get_or_create_worksheet(ws_title)
     out = df.copy()
 
@@ -178,20 +164,20 @@ def ws_append_row(ws_title: str, row_dict: dict, columns: list[str]) -> None:
         row.append(str(v))
     ws.append_row(row, value_input_option="USER_ENTERED")
 
-def ensure_columns(df: pd.DataFrame, cols: list[str], defaults: dict[str, object] | None = None) -> pd.DataFrame:
-    """Ensure df has all cols in order; fill missing with defaults."""
-    defaults = defaults or {}
-    out = df.copy()
-    for c in cols:
-        if c not in out.columns:
-            out[c] = defaults.get(c, "")
-    return out[cols]
-
 def clear_cache_and_rerun(msg: str | None = None):
     st.cache_data.clear()
     if msg:
         st.success(msg)
     st.rerun()
+
+def _ledger_type_changed():
+    """구분(지출/수입) 변경 시, 카테고리 옵션에 맞게 선택값을 자동 보정."""
+    entry_type = st.session_state.get("ledger_entry_type", "지출")
+    opts = expense_categories if entry_type == "지출" else income_categories
+    cur = st.session_state.get("ledger_category")
+    if cur not in opts:
+        st.session_state["ledger_category"] = opts[0]
+
 
 # ============================================================
 # 카테고리
@@ -573,22 +559,51 @@ SIMPLE_COLS = ["id", "date", "type", "amount", "memo", "user"]
 CARDS_COLS = ["card_name", "benefits"]
 CARD_SUBS_COLS = ["card_name", "merchant", "amount", "day", "memo"]
 
+def current_user() -> str:
+    u = str(st.session_state.current_user or "").strip()
+    return u if u else "me"
+
+# ============================================================
+# 로드/저장 (Sheets)
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=20)
 def load_ledger() -> pd.DataFrame:
     df = ws_read_df("ledger", LEDGER_COLS)
+
     if len(df):
-        df = ensure_columns(df, LEDGER_COLS, defaults={"amount": 0})
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df["type"] = df["type"].fillna("").astype(str)
-        df["category"] = df["category"].fillna("").astype(str)
-        df["memo"] = df["memo"].fillna("").astype(str)
-        df["id"] = df["id"].fillna("").astype(str)
+        df["memo"] = df["memo"].fillna("")
+        df["type"] = df["type"].fillna("")
+        df["category"] = df["category"].fillna("")
+        df["fixed_key"] = df["fixed_key"].fillna("").astype(str)
         df["user"] = df["user"].fillna("").astype(str)
-    return df
+
+    if "id" not in df.columns:
+        df.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(df))])
+
+    # ⚠️ 여기서 save_ledger(df) 자동 호출은 "로드 시 덮어쓰기"라 불필요한 느려짐의 원인이라 제거
+    return df[LEDGER_COLS].copy()
+
 def save_ledger(df: pd.DataFrame) -> None:
-    out = ensure_columns(df, LEDGER_COLS, defaults={"amount": 0})
+    out = df.copy()
+    for c in LEDGER_COLS:
+        if c not in out.columns:
+            out[c] = "" if c not in ["amount"] else 0
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
-    ws_write_df("ledger", out, LEDGER_COLS)
+    out["memo"] = out["memo"].fillna("")
+    out["type"] = out["type"].fillna("")
+    out["category"] = out["category"].fillna("")
+    out["fixed_key"] = out["fixed_key"].fillna("").astype(str)
+    out["user"] = out["user"].fillna("").astype(str)
+
+    ws_write_df("ledger", out[LEDGER_COLS], LEDGER_COLS)
+
+# ============================================================
+# ✅ 고정지출/정기결제 반영 (user도 포함)
+# ============================================================
 def apply_fixed_to_ledger_for_month(ledger_df: pd.DataFrame, fixed_df: pd.DataFrame, year: int, month: int):
     if fixed_df is None or len(fixed_df) == 0:
         return ledger_df, 0
@@ -751,37 +766,68 @@ def save_budget_month(bdf_month: pd.DataFrame, year: int, month: int) -> None:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def load_fixed() -> pd.DataFrame:
-    df = ws_read_df("fixed_expenses", FIXED_COLS)
-    if len(df):
-        df = ensure_columns(df, FIXED_COLS, defaults={"amount": 0})
-        df["fixed_id"] = df["fixed_id"].fillna("").astype(str)
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-        df["day"] = pd.to_numeric(df["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
-        df["category"] = df["category"].fillna("").astype(str)
-        df["memo"] = df["memo"].fillna("").astype(str)
-        df["active"] = df["active"].fillna("Y").astype(str)
-        df["user"] = df["user"].fillna("").astype(str)
-    return df
+    fdf = ws_read_df("fixed_expenses", FIXED_COLS)
+
+    if len(fdf):
+        fdf["fixed_id"] = fdf["fixed_id"].fillna("").astype(str)
+        mask = (fdf["fixed_id"].str.strip() == "")
+        if mask.any():
+            fdf.loc[mask, "fixed_id"] = [str(uuid.uuid4()) for _ in range(mask.sum())]
+
+        fdf["amount"] = pd.to_numeric(fdf["amount"], errors="coerce").fillna(0).astype(int)
+        fdf["day"] = pd.to_numeric(fdf["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
+        fdf["memo"] = fdf["memo"].fillna("")
+        fdf["name"] = fdf["name"].fillna("")
+        return fdf.reset_index(drop=True)
+
+    return pd.DataFrame(columns=FIXED_COLS)
+
 def save_fixed(fdf: pd.DataFrame) -> None:
-    out = ensure_columns(fdf, FIXED_COLS, defaults={"amount": 0})
+    out = fdf.copy()
+
+    for col in FIXED_COLS:
+        if col not in out.columns:
+            out[col] = "" if col in ["fixed_id", "name", "memo"] else 0
+
+    out["fixed_id"] = out["fixed_id"].fillna("").astype(str)
+    mask = (out["fixed_id"].str.strip() == "")
+    if mask.any():
+        out.loc[mask, "fixed_id"] = [str(uuid.uuid4()) for _ in range(mask.sum())]
+
+    out["name"] = out["name"].fillna("").astype(str)
+    out["memo"] = out["memo"].fillna("").astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
-    ws_write_df("fixed_expenses", out, FIXED_COLS)
+    out["day"] = pd.to_numeric(out["day"], errors="coerce").fillna(1).astype(int).clip(1, 31)
+
+    out = out[out["name"].str.strip() != ""].copy()
+    ws_write_df("fixed_expenses", out[FIXED_COLS], FIXED_COLS)
+
+@st.cache_data(show_spinner=False, ttl=20)
 def load_simple_money_log(ws_title: str) -> pd.DataFrame:
     df = ws_read_df(ws_title, SIMPLE_COLS)
     if len(df):
-        df = ensure_columns(df, SIMPLE_COLS, defaults={"amount": 0})
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df["type"] = df["type"].fillna("").astype(str)
-        df["category"] = df["category"].fillna("").astype(str)
-        df["memo"] = df["memo"].fillna("").astype(str)
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-        df["id"] = df["id"].fillna("").astype(str)
+        df["type"] = df["type"].fillna("")
+        df["memo"] = df["memo"].fillna("")
         df["user"] = df["user"].fillna("").astype(str)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
     return df
+
 def save_simple_money_log(ws_title: str, df: pd.DataFrame) -> None:
-    out = ensure_columns(df, SIMPLE_COLS, defaults={"amount": 0})
+    out = df.copy()
+    for c in SIMPLE_COLS:
+        if c not in out.columns:
+            out[c] = "" if c != "amount" else 0
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
+    out["type"] = out["type"].fillna("")
+    out["memo"] = out["memo"].fillna("")
+    out["user"] = out["user"].fillna("").astype(str)
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
-    ws_write_df(ws_title, out, SIMPLE_COLS)
+
+    ws_write_df(ws_title, out[SIMPLE_COLS], SIMPLE_COLS)
+
+@st.cache_data(show_spinner=False, ttl=120)
 def load_cards() -> pd.DataFrame:
     df = ws_read_df("cards", CARDS_COLS)
     df["card_name"] = df["card_name"].fillna("").astype(str)
@@ -920,13 +966,13 @@ tab_main, tab_budget, tab_fixed, tab_event, tab_zeropay, tab_card = st.tabs(
 with tab_main:
     st.subheader("내역 입력")
 
+    # ✅ form 안에서는 selectbox 변경이 즉시 반영되지 않아(리런 X) 카테고리 옵션이 안 바뀌는 문제가 생길 수 있어요.
+    #    그래서 '구분'은 form 밖에서 선택하고, 변경 시 카테고리를 자동 보정합니다.
+    entry_type = st.selectbox("구분", ["지출", "수입"], key="ledger_entry_type", on_change=_ledger_type_changed)
+    category_options = expense_categories if entry_type == "지출" else income_categories
+
     with st.form("ledger_entry_form_horizontal"):
-        c_type, c_date, c_cat, c_amt, c_btn = st.columns([1.0, 1.25, 1.6, 1.0, 0.9])
-
-        with c_type:
-            entry_type = st.selectbox("구분", ["지출", "수입"], key="ledger_entry_type")
-
-        category_options = expense_categories if entry_type == "지출" else income_categories
+        c_date, c_cat, c_amt, c_btn = st.columns([1.25, 1.6, 1.0, 0.9])
 
         with c_date:
             entry_date = st.date_input("날짜", value=date.today(), key="ledger_date")
@@ -942,7 +988,7 @@ with tab_main:
 
         memo = st.text_input("메모(선택)", key="ledger_memo")
 
-    # ✅ 여기서부터 속도 개선 핵심: append로 바로 저장
+    # ✅ append로 바로 저장
     if submitted:
         amt = to_int_money(amt_str, 0)
         new_row = {
@@ -956,6 +1002,11 @@ with tab_main:
             "user": current_user(),
         }
         ws_append_row("ledger", new_row, LEDGER_COLS)
+
+        # ✅ '추가했는데 안 보인다' 체감 방지: 방금 입력한 날짜의 월로 자동 이동
+        st.session_state["main_year"] = entry_date.year
+        st.session_state["main_month"] = entry_date.month
+
         clear_cache_and_rerun("추가되었습니다!")
 
     st.divider()
