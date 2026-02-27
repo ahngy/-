@@ -215,6 +215,13 @@ def _ws_read_df_cached(ws_title: str, columns: tuple[str, ...], bust: int) -> pd
 
     return df[list(columns)].copy()
 
+
+def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
+    """워크시트 전체를 DataFrame으로 읽어옵니다.
+    - ttl 캐시 + 수동 새로고침/쓰기 후 캐시 무효화(bust) 지원
+    """
+    return _ws_read_df_cached(ws_title, tuple(columns), _cache_bust())
+
 def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
     # ⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
     ws = get_or_create_worksheet(ws_title)
