@@ -999,7 +999,17 @@ with tab_main:
             "fixed_key": "",
             "user": current_user(),
         }
-        ws_append_row("ledger", new_row, LEDGER_COLS)
+        try:
+            ws_append_row("ledger", new_row, LEDGER_COLS)
+        except Exception as e:
+            st.error(f"저장 중 오류가 발생했습니다: {e}")
+            st.stop()
+        # 방금 입력한 날짜의 월로 자동 이동(추가 후 바로 보이도록)
+        try:
+            st.session_state["main_year"] = entry_date.year
+            st.session_state["main_month"] = f"{entry_date.month}월"
+        except Exception:
+            pass
         clear_cache_and_rerun("추가되었습니다!")
 
     st.divider()
