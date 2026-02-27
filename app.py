@@ -12,6 +12,34 @@ import textwrap
 import gspread
 from google.oauth2.service_account import Credentials
 
+import time
+import random
+from gspread.exceptions import APIError, WorksheetNotFound
+
+def _is_quota_429(err: Exception) -> bool:
+    s = str(err)
+    return ("[429]" in s) or ("Quota exceeded" in s) or ("READ_REQUESTS" in s)
+
+def _with_retry(fn, tries: int = 6, base_sleep: float = 0.6):
+    """429(Quota) / 일시적 오류에 대한 지수 백오프 재시도."""
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except APIError as e:
+            last = e
+            if _is_quota_429(e) or ("503" in str(e)) or ("500" in str(e)):
+                time.sleep(base_sleep * (2 ** i) + random.random() * 0.2)
+                continue
+            raise
+    raise last
+
+def _cache_bust() -> int:
+    return int(st.session_state.get("_cache_bust", 0))
+
+def _bump_cache():
+    st.session_state["_cache_bust"] = _cache_bust() + 1
+
 # ============================================================
 # 기본 설정
 # ============================================================
@@ -47,7 +75,7 @@ if not st.session_state.authenticated:
     if has_users:
         username = st.text_input("아이디", value="", key="login_username")
         pw = st.text_input("비밀번호", type="password", key="login_password")
-        login = st.button("로그인", use_container_width=True, key="login_btn")
+        login = st.button("로그인", width="stretch", key="login_btn")
 
         if login:
             if username in USERS and pw.strip() == str(USERS[username]).strip():
@@ -59,7 +87,7 @@ if not st.session_state.authenticated:
                 st.error("아이디/비밀번호가 틀렸어요.")
     else:
         pw = st.text_input("비밀번호를 입력하세요", type="password", key="login_password_only")
-        login = st.button("로그인", use_container_width=True, key="login_btn_only")
+        login = st.button("로그인", width="stretch", key="login_btn_only")
 
         if login:
             if pw.strip() == str(PASSWORD).strip():
@@ -77,21 +105,67 @@ st.title("나의 가계부")
 # ============================================================
 # Google Sheets 연결
 # ============================================================
-GSHEET_ID = st.secrets["gsheets"]["spreadsheet_id"]
-SA_INFO = dict(st.secrets["gcp_service_account"])
+# ============================================================
+# ✅ Google Sheets 연결
+# ============================================================
+def _get_secret(path, default=None):
+    """st.secrets 접근을 안전하게 처리."""
+    try:
+        cur = st.secrets
+        for key in path:
+            cur = cur[key]
+        return cur
+    except Exception:
+        return default
+
+def _normalize_sheet_id(v: str) -> str:
+    """스프레드시트 ID 또는 URL을 받아 ID만 추출."""
+    if not v:
+        return ""
+    v = str(v).strip()
+    # URL 형태면 /d/<ID>/ 추출
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", v)
+    if m:
+        return m.group(1)
+    # gid=... 파라미터가 있어도 무시하고 ID로 간주
+    return v
+
+GSHEET_ID = _normalize_sheet_id(_get_secret(["gsheets", "spreadsheet_id"], ""))
+SA_INFO = dict(_get_secret(["gcp_service_account"], {}) or {})
 
 SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
 @st.cache_resource(show_spinner=False)
 def gs_client():
     creds = Credentials.from_service_account_info(SA_INFO, scopes=SCOPE)
     return gspread.authorize(creds)
 
 def get_spreadsheet():
-    return gs_client().open_by_key(GSHEET_ID)
+    """스프레드시트를 열고, 실패 시 사용자에게 원인/해결 안내."""
+    if not GSHEET_ID:
+        st.error("GSHEET_ID(스프레드시트 ID)가 비어있습니다. Streamlit secrets의 gsheets.spreadsheet_id를 확인해주세요.")
+        st.stop()
+    if not SA_INFO:
+        st.error("서비스 계정 정보(gcp_service_account)가 비어있습니다. Streamlit secrets 설정을 확인해주세요.")
+        st.stop()
+    try:
+        return _with_retry(lambda: gs_client().open_by_key(GSHEET_ID))
+    except gspread.exceptions.APIError as e:
+        st.error("Google Sheets API 호출이 실패했습니다. 아래를 확인해주세요.")
+        st.markdown("""
+- **스프레드시트가 서비스계정 이메일에 '편집자'로 공유**되어 있는지
+- `gsheets.spreadsheet_id`가 **ID만**(또는 URL이면 /d/.../ 포함) 맞는지
+- Google Sheets/Drive API가 활성화되어 있는지(해당 GCP 프로젝트)
+- 쿼터/일시적 장애(429/503)면 잠시 후 재시도
+""")
+        st.caption(f"상세: {type(e).__name__}")
+        st.stop()
+    except Exception as e:
+        st.error("스프레드시트를 여는 중 알 수 없는 오류가 발생했습니다.")
+        st.caption(f"상세: {type(e).__name__}: {e}")
+        st.stop()
 
 def get_or_create_worksheet(title: str, rows: int = 4000, cols: int = 40):
     """워크시트를 가져오고, '없을 때만' 생성합니다.
@@ -101,70 +175,73 @@ def get_or_create_worksheet(title: str, rows: int = 4000, cols: int = 40):
     """
     sh = get_spreadsheet()
     try:
-        return sh.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
+        return _with_retry(lambda: sh.worksheet(title))
+    except WorksheetNotFound:
         try:
-            return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+            return _with_retry(lambda: sh.add_worksheet(title=title, rows=str(rows), cols=str(cols)))
         except Exception:
-            # 누군가가 동시에 만든 경우 등: 한 번 더 조회
-            return sh.worksheet(title)
+            return _with_retry(lambda: sh.worksheet(title))
 
-def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
+def _ensure_header(ws, columns: list[str]):
+    """헤더가 비어있을 때만 1회 생성(불필요한 read 폭증 방지)."""
+    key = f"{ws.title}__header_ok"
+    if st.session_state.get(key):
+        return
+    header = _with_retry(lambda: ws.row_values(1))
+    if not header or all(str(x).strip() == "" for x in header):
+        _with_retry(lambda: ws.update([columns]))
+    st.session_state[key] = True
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _ws_read_df_cached(ws_title: str, columns: tuple[str, ...], bust: int) -> pd.DataFrame:
     ws = get_or_create_worksheet(ws_title)
-    values = ws.get_all_values()
+    _ensure_header(ws, list(columns))
+    values = _with_retry(lambda: ws.get_all_values())
 
     if not values:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=list(columns))
 
     header = values[0]
     data = values[1:]
 
-    # 헤더가 비었거나 이상하면 강제로 columns 사용
     if len(header) == 0 or all(str(h).strip() == "" for h in header):
-        header = columns
+        header = list(columns)
 
     df = pd.DataFrame(data, columns=header[: len(header)])
 
-    # 누락 컬럼 보정
     for c in columns:
         if c not in df.columns:
             df[c] = ""
 
-    return df[columns].copy()
+    return df[list(columns)].copy()
 
 def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
     # ⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
     ws = get_or_create_worksheet(ws_title)
-    out = df.copy()
+    _ensure_header(ws, columns)
 
+    out = df.copy()
     for c in columns:
         if c not in out.columns:
             out[c] = ""
-
     out = out[columns].fillna("")
 
     values = [columns] + out.astype(str).values.tolist()
-    ws.clear()
-    ws.update(values)
+    _with_retry(lambda: ws.clear())
+    _with_retry(lambda: ws.update(values))
+    _bump_cache()
 
 def ws_append_row(ws_title: str, row_dict: dict, columns: list[str]) -> None:
     # ✅ 빠른 추가(append) 저장 (동시 입력에도 강함)
     ws = get_or_create_worksheet(ws_title)
+    _ensure_header(ws, columns)
 
-    # 헤더 없으면 생성
-    existing = ws.get_all_values()
-    if not existing:
-        ws.update([columns])
-
-    row = []
-    for c in columns:
-        v = row_dict.get(c, "")
-        if v is None:
-            v = ""
-        row.append(str(v))
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    row = [str(row_dict.get(c, "") or "") for c in columns]
+    _with_retry(lambda: ws.append_row(row, value_input_option="USER_ENTERED", table_range="A1"))
+    _bump_cache()
 
 def clear_cache_and_rerun(msg: str | None = None):
+
     st.cache_data.clear()
     if msg:
         st.success(msg)
@@ -566,7 +643,7 @@ def current_user() -> str:
 # ============================================================
 # 로드/저장 (Sheets)
 # ============================================================
-@st.cache_data(show_spinner=False, ttl=20)
+@st.cache_data(show_spinner=False, ttl=120)
 def load_ledger() -> pd.DataFrame:
     df = ws_read_df("ledger", LEDGER_COLS)
 
@@ -802,7 +879,7 @@ def save_fixed(fdf: pd.DataFrame) -> None:
     out = out[out["name"].str.strip() != ""].copy()
     ws_write_df("fixed_expenses", out[FIXED_COLS], FIXED_COLS)
 
-@st.cache_data(show_spinner=False, ttl=20)
+@st.cache_data(show_spinner=False, ttl=120)
 def load_simple_money_log(ws_title: str) -> pd.DataFrame:
     df = ws_read_df(ws_title, SIMPLE_COLS)
     if len(df):
@@ -947,10 +1024,10 @@ with st.sidebar:
     st.write(f"**{current_user()}**")
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        if st.button("새로고침", use_container_width=True):
+        if st.button("새로고침", width="stretch"):
             clear_cache_and_rerun()
     with col_s2:
-        if st.button("로그아웃", use_container_width=True):
+        if st.button("로그아웃", width="stretch"):
             do_logout()
 
 # ============================================================
@@ -984,7 +1061,7 @@ with tab_main:
             amt_str = st.text_input("금액(원)", value="0", key="ledger_amount_str", help="예: 12,000")
 
         with c_btn:
-            submitted = st.form_submit_button("추가", use_container_width=True)
+            submitted = st.form_submit_button("추가", width="stretch")
 
         memo = st.text_input("메모(선택)", key="ledger_memo")
 
@@ -1156,10 +1233,11 @@ with tab_main:
         if show_user_col:
             column_config["user"] = st.column_config.TextColumn("작성자", disabled=True)
 
-        edited = st.data_editor(
+        edited = view = view.reset_index(drop=True)
+        st.data_editor(
             view,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config=column_config,
             key="ledger_editor",
         )
@@ -1225,7 +1303,7 @@ with tab_main:
         data=excel_bytes,
         file_name=f"가계부_{selected_year}-{selected_month:02d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 
 # ============================================================
@@ -1240,10 +1318,11 @@ with tab_budget:
     bview["budget_str"] = bview["budget"].apply(money_str)
     bview = bview[["category", "budget_str"]].copy()
 
-    edited_bdf = st.data_editor(
+    edited_bdf = bview = bview.reset_index(drop=True)
+    st.data_editor(
         bview,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "category": st.column_config.TextColumn("카테고리", disabled=True),
             "budget_str": st.column_config.TextColumn("목표 금액(원)"),
@@ -1285,10 +1364,11 @@ with tab_fixed:
     fview["amount_str"] = fview["amount"].apply(money_str)
     fview = fview[["name", "amount_str", "day", "memo"]].copy()
 
-    edited_fixed = st.data_editor(
+    edited_fixed = fview = fview.reset_index(drop=True)
+    st.data_editor(
         fview,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         column_config={
             "name": st.column_config.TextColumn("이름"),
@@ -1341,7 +1421,7 @@ def simple_log_tab(title: str, ws_title: str, state_key: str):
             amt_str = st.text_input("금액(원)", value="0", key=f"{state_key}_amount_str", help="예: 50,000")
 
         with c_btn:
-            ok = st.form_submit_button("추가", use_container_width=True)
+            ok = st.form_submit_button("추가", width="stretch")
 
         memo = st.text_input("메모(선택)", value="", key=f"{state_key}_memo")
 
@@ -1385,10 +1465,11 @@ def simple_log_tab(title: str, ws_title: str, state_key: str):
     view.insert(0, "삭제", False)
     view = view.set_index("id")
 
-    edited = st.data_editor(
+    edited = view = view.reset_index(drop=True)
+    st.data_editor(
         view,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "삭제": st.column_config.CheckboxColumn("삭제"),
             "date": st.column_config.DateColumn("날짜"),
@@ -1456,10 +1537,11 @@ with tab_card:
     if len(cards_df) == 0:
         cards_df = pd.DataFrame([{"card_name": "예: OO카드", "benefits": "예: 주유 5% / 커피 10%"}])
 
-    edited_cards = st.data_editor(
+    edited_cards = cards_df = cards_df.reset_index(drop=True)
+    st.data_editor(
         cards_df,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         column_config={
             "card_name": st.column_config.TextColumn("카드명"),
@@ -1497,7 +1579,7 @@ with tab_card:
         t = totals.copy()
         t.columns = ["카드", "합계(원)"]
         t["합계(원)"] = t["합계(원)"].apply(money_str)
-        st.dataframe(t, use_container_width=True, hide_index=True)
+        st.dataframe(t, width="stretch", hide_index=True)
 
     st.divider()
 
@@ -1520,10 +1602,11 @@ with tab_card:
     view["amount_str"] = view["amount"].apply(money_str)
     view = view[["merchant", "amount_str", "day", "memo"]].copy()
 
-    edited = st.data_editor(
+    edited = view = view.reset_index(drop=True)
+    st.data_editor(
         view,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         column_config={
             "merchant": st.column_config.TextColumn("정기결제명"),
