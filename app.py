@@ -948,13 +948,29 @@ tab_main, tab_budget, tab_fixed, tab_event, tab_zeropay, tab_card = st.tabs(
 with tab_main:
     st.subheader("내역 입력")
 
+    # ✅ Streamlit form 안에서는 위젯 간 의존(구분→카테고리)이 즉시 반영되지 않아요.
+    #    그래서 '구분'은 form 밖에서 선택하게 하고, 바뀔 때마다 카테고리를 자동으로 초기화합니다.
+    def _ledger_type_changed():
+        t = st.session_state.get("ledger_entry_type", "지출")
+        opts = expense_categories if t == "지출" else income_categories
+        cur = st.session_state.get("ledger_category", "")
+        if cur not in opts:
+            st.session_state["ledger_category"] = opts[0] if len(opts) else ""
+
+    entry_type = st.selectbox(
+        "구분",
+        ["지출", "수입"],
+        key="ledger_entry_type",
+        on_change=_ledger_type_changed,
+    )
+
+    category_options = expense_categories if entry_type == "지출" else income_categories
+    # 최초 진입/새로고침 시에도 현재 카테고리가 옵션에 없으면 안전하게 보정
+    if st.session_state.get("ledger_category", "") not in category_options:
+        st.session_state["ledger_category"] = category_options[0] if len(category_options) else ""
+
     with st.form("ledger_entry_form_horizontal"):
-        c_type, c_date, c_cat, c_amt, c_btn = st.columns([1.0, 1.25, 1.6, 1.0, 0.9])
-
-        with c_type:
-            entry_type = st.selectbox("구분", ["지출", "수입"], key="ledger_entry_type")
-
-        category_options = expense_categories if entry_type == "지출" else income_categories
+        c_date, c_cat, c_amt, c_btn = st.columns([1.25, 1.6, 1.0, 0.9])
 
         with c_date:
             entry_date = st.date_input("날짜", value=date.today(), key="ledger_date")
