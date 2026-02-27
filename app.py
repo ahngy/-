@@ -147,7 +147,7 @@ def ws_read_df(ws_title: str, columns: list[str]) -> pd.DataFrame:
     return df[columns].copy()
 
 def ws_write_df(ws_title: str, df: pd.DataFrame, columns: list[str]) -> None:
-    # ⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
+    #⚠️ 전체 덮어쓰기 (편집/삭제/설정 저장에서 사용)
     ws = get_or_create_worksheet(ws_title)
     out = df.copy()
 
@@ -582,7 +582,7 @@ def load_ledger() -> pd.DataFrame:
         df["type"] = df["type"].fillna("").astype(str)
         df["category"] = df["category"].fillna("").astype(str)
         df["memo"] = df["memo"].fillna("").astype(str)
-        df["ledger_id"] = df["ledger_id"].fillna("").astype(str)
+        df["id"] = df["id"].fillna("").astype(str)
         df["user"] = df["user"].fillna("").astype(str)
     return df
 def save_ledger(df: pd.DataFrame) -> None:
